@@ -213,7 +213,7 @@ static int test_vec_dot_ternary(bool verbose) {
         // blocks, i.e. an even number of 128-weight blocks.
         const bool  q8k      = type == GGML_TYPE_PQ2_0;
         const ggml_type ytype = q8k ? GGML_TYPE_Q8_K : GGML_TYPE_Q8_0;
-        for (int nb : q8k ? std::vector<int>{2, 4} : std::vector<int>{1, 3}) {
+        for (int nb : q8k ? std::vector<int>{2, 4} : std::vector<int>{1, 3, 16, 40, 48, 80, 136}) {
             const int n = nb * 128;
             std::vector<block_pq2_0> pq(nb);
             std::vector<block_ptq1_0> ptq(nb);
@@ -223,7 +223,7 @@ static int test_vec_dot_ternary(bool verbose) {
             const void * weights = type == GGML_TYPE_PQ2_0 ? (const void *) pq.data() : (const void *) ptq.data();
             for (int pattern = 0; pattern < 256; ++pattern) {
                 for (int i = 0; i < nb; ++i) {
-                    pq[i].d = ptq[i].d = ggml_fp32_to_fp16(0.25f * (i + 1));
+                    pq[i].d = ptq[i].d = ggml_fp32_to_fp16(0.25f * (i % 4 + 1));
                     for (size_t j = 0; j < sizeof(pq[i].qs); ++j) {
                         pq[i].qs[j] = (uint8_t) (pattern + 17*j + i);
                     }
@@ -281,6 +281,92 @@ static int test_vec_dot_ternary(bool verbose) {
     return num_failed;
 }
 
+static int test_vec_dot_ptq1_0(bool verbose) {
+    const auto * traits = ggml_get_type_traits(GGML_TYPE_PTQ1_0);
+    const auto * cpu = ggml_get_type_traits_cpu(GGML_TYPE_PTQ1_0);
+    const auto * q8_traits = ggml_get_type_traits(GGML_TYPE_Q8_0);
+    int num_failed = 0;
+
+    // One-hot activations check every trit position, including the 80/96/120 run boundaries.
+    block_ptq1_0 weight = {};
+    block_q8_0 acts[4] = {};
+    float weights[QK_PTQ1_0];
+    weight.d = ggml_fp32_to_fp16(0.25f);
+    for (int i = 0; i < 4; ++i) {
+        acts[i].d = ggml_fp32_to_fp16(0.125f * (i + 1));
+    }
+    for (int pattern = 0; pattern < 256; ++pattern) {
+        for (size_t i = 0; i < sizeof(weight.qs); ++i) {
+            weight.qs[i] = (uint8_t) (pattern + 17*i);
+        }
+        for (size_t i = 0; i < sizeof(weight.qh); ++i) {
+            weight.qh[i] = (uint8_t) (pattern + 37*i);
+        }
+        traits->to_float(&weight, weights, QK_PTQ1_0);
+        for (int pos = 0; pos < QK_PTQ1_0; ++pos) {
+            for (int activation : {-128, 127}) {
+                acts[pos / QK8_0].qs[pos % QK8_0] = (int8_t) activation;
+                const float ref = weights[pos] * ggml_fp16_to_fp32(acts[pos / QK8_0].d) * activation;
+                float result = INFINITY;
+                cpu->vec_dot(QK_PTQ1_0, &result, 0, &weight, 0, acts, 0, 1);
+                const bool failed = result != ref;
+                num_failed += failed;
+                if (failed) {
+                    printf("ptq1_0 one-hot pattern=%d pos=%d activation=%d: FAILED (ref=%f got=%f)\n", pattern, pos, activation, ref, result);
+                }
+            }
+            acts[pos / QK8_0].qs[pos % QK8_0] = 0;
+        }
+    }
+
+    // Non-dyadic FP16 scales expose float accumulation differences at Bonsai projection widths.
+    for (int n : {128, 384, 2048, 5120, 6144, 10240, 17408}) {
+        std::vector<block_ptq1_0> ptq(n / QK_PTQ1_0);
+        std::vector<block_q8_0> q8(n / QK8_0);
+        std::vector<float> x(n), y(n);
+        for (int pattern = 0; pattern < 4; ++pattern) {
+            for (size_t i = 0; i < ptq.size(); ++i) {
+                ptq[i].d = ggml_fp32_to_fp16(0.0153f + 0.0307f * (i % 11));
+                for (size_t j = 0; j < sizeof(ptq[i].qs); ++j) {
+                    ptq[i].qs[j] = (uint8_t) (pattern * 83 + i * 31 + j * 17);
+                }
+                for (size_t j = 0; j < sizeof(ptq[i].qh); ++j) {
+                    ptq[i].qh[j] = (uint8_t) (pattern * 47 + i * 23 + j * 37);
+                }
+            }
+            for (size_t i = 0; i < q8.size(); ++i) {
+                q8[i].d = ggml_fp32_to_fp16(0.003f + 0.017f * (i % 7));
+                for (int j = 0; j < QK8_0; ++j) {
+                    q8[i].qs[j] = (int8_t) ((int) ((pattern * 59 + i * 13 + j * 37) % 256) - 128);
+                }
+            }
+            traits->to_float(ptq.data(), x.data(), n);
+            q8_traits->to_float(q8.data(), y.data(), n);
+            double ref = 0.0;
+            double abs_sum = 0.0;
+            for (int j = 0; j < n; ++j) {
+                const double product = (double) x[j] * (double) y[j];
+                ref += product;
+                abs_sum += fabs(product);
+            }
+            float result = INFINITY;
+            cpu->vec_dot(n, &result, 0, ptq.data(), 0, q8.data(), 0, 1);
+            // Scale the bound by absolute products so near-zero sums do not hide cancellation.
+            const double error = fabs((double) result - ref);
+            const double limit = 1.0e-5 * abs_sum + 1.0e-5;
+            const bool failed = !(error <= limit);
+            num_failed += failed;
+            if (failed || verbose) {
+                printf("ptq1_0 mixed-scale n=%d pattern=%d: %s (ref=%.9g got=%.9g err=%.9g limit=%.9g)\n", n, pattern, RESULT_STR[failed], ref, result, error, limit);
+            }
+        }
+    }
+    if (num_failed || verbose) {
+        printf("ptq1_0 trit positions and mixed scales: %s (%d failures)\n", RESULT_STR[num_failed != 0], num_failed);
+    }
+    return num_failed;
+}
+
 int main(int argc, char * argv[]) {
     bool verbose = false;
 
@@ -303,6 +389,7 @@ int main(int argc, char * argv[]) {
     num_failed += test_vec_dot_f32(verbose);
     num_failed += test_vec_dot_q(verbose);
     num_failed += test_vec_dot_ternary(verbose);
+    num_failed += test_vec_dot_ptq1_0(verbose);
 
     if (num_failed || verbose) {
         printf("%d tests failed\n", num_failed);

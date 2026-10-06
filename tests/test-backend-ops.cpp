@@ -9532,6 +9532,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Bonsai row widths in correctness mode: converted F32 and direct Q8_0 activations, with a row tail.
+    for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) {
+        for (int k : {128, 5120, 6144, 10240, 17408}) {
+            for (int n : {1, 2, 3, 4, 8}) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, type_b, 31, n, k, {1, 1}, {1, 1}));
+            }
+        }
+        // Padded rows force stride handling with batched weights and a repeated outer plane.
+        for (int k : {128, 5120}) {
+            for (int n : {1, 3, 8}) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, type_b, 7, n, k, {2, 1}, {1, 2}, {0, 1, 2, 3}, k + 128));
+            }
+        }
+    }
+
     // BF16 is absent from base_types: add the 3 standard non-contig permutations explicitly
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 16,  1, 256, {2, 3}, {1, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 16,  1, 256, {2, 3}, {1, 1}, {0, 1, 3, 2}));
