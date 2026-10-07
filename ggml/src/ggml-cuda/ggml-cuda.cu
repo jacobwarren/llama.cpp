@@ -6011,6 +6011,7 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     #endif
 
     features.push_back({ "PTQ1_0_SOA_WARPS_REQUEST", ggml_cuda_ptq1_0_soa_warps_request() == 2 ? "2" : "4" });
+    features.push_back({ "PTQ1_0_SOA_LANES_REQUEST", ggml_cuda_ptq1_0_soa_lanes_request() == 16 ? "16" : "32" });
 
     #ifdef GGML_CUDA_FA_ALL_QUANTS
         features.push_back({ "FA_ALL_QUANTS", "1" });

@@ -19,7 +19,7 @@ static void write_bytes(FILE * output, const void * bytes, size_t size) {
     GGML_ASSERT(std::fwrite(bytes, 1, size, output) == size);
 }
 
-static void initialize(ggml_context * ctx, int seed) {
+static void initialize(ggml_context * ctx, int seed, const geometry_case & c) {
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
         if (t->view_src) { continue; }
         if (t->type == GGML_TYPE_PTQ1_0) {
@@ -29,6 +29,14 @@ static void initialize(ggml_context * ctx, int seed) {
                 blocks[i].d = ggml_fp32_to_fp16(0.00741f + 0.02539f * ((i + weight_seed) % 13));
                 for (size_t j = 0; j < sizeof(blocks[i].qs); ++j) { blocks[i].qs[j] = static_cast<uint8_t>(weight_seed * 83 + i * 31 + j * 17); }
                 for (size_t j = 0; j < sizeof(blocks[i].qh); ++j) { blocks[i].qh[j] = static_cast<uint8_t>(weight_seed * 47 + i * 23 + j * 37); }
+                if (c.kind == 6 && std::strcmp(t->name, "a") == 0) {
+                    const size_t row = i / 40;
+                    const size_t kb = i % 40;
+                    const bool negative = kb == 32 || (kb == 16 && (row & 1));
+                    blocks[i].d = ggml_fp32_to_fp16(kb == 0 || kb == 32 ? 2048.0f : kb == 16 ? (1 << (row % 3)) / 16384.0f : 0.0f);
+                    std::memset(blocks[i].qs, negative ? 0 : 255, sizeof(blocks[i].qs));
+                    std::memset(blocks[i].qh, negative ? 0 : 255, sizeof(blocks[i].qh));
+                }
             }
             ggml_backend_tensor_set(t, blocks.data(), 0, blocks.size() * sizeof(blocks[0]));
         } else if (t->type == GGML_TYPE_F32) {
@@ -44,7 +52,7 @@ static void initialize(ggml_context * ctx, int seed) {
                 for (size_t i = 0; i < values.size(); ++i) { values[i] = (i % 3) ? 1.0f : -1.0f; }
             } else if (std::strcmp(t->name, "b") == 0) {
                 for (size_t i = 0; i < values.size(); ++i) {
-                    values[i] = seed % 5 == 0 ? 0.0f : (static_cast<int>((i * 37 + seed * 13) % 257) - 128) *
+                    values[i] = c.kind == 6 ? 127.0f : seed % 5 == 0 ? 0.0f : (static_cast<int>((i * 37 + seed * 13) % 257) - 128) *
                         (0.0137f + 0.03f * (i % 11));
                 }
             } else if (std::strcmp(t->name, "bias") == 0 || std::strcmp(t->name, "gate_bias") == 0) {
@@ -58,9 +66,11 @@ static void initialize(ggml_context * ctx, int seed) {
 
 static ggml_tensor * graph(ggml_context * ctx, const geometry_case & c) {
     const int storage_k = c.kind == 5 ? c.k + 128 : c.k;
-    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_PTQ1_0, storage_k, c.m);
+    ggml_tensor * a = c.kind == 7 ? ggml_new_tensor_1d(ctx, GGML_TYPE_PTQ1_0, c.k * c.m + 128) :
+                                  ggml_new_tensor_2d(ctx, GGML_TYPE_PTQ1_0, storage_k, c.m);
     ggml_set_name(a, "a");
     if (c.kind == 5) { a = ggml_view_2d(ctx, a, c.k, c.m, a->nb[1], 0); }
+    if (c.kind == 7) { a = ggml_view_2d(ctx, a, c.k, c.m, c.k / QK_PTQ1_0 * sizeof(block_ptq1_0), sizeof(block_ptq1_0)); }
     ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.k, c.n);
     ggml_set_name(b, "b");
     if (c.kind == 4) {
@@ -115,6 +125,10 @@ int main(int argc, char ** argv) {
     }
     for (int n : {2, 4, 5, 8}) { cases.push_back({7, n, 5120, 0}); }
     cases.push_back({7, 1, 5120, 5});
+    cases.push_back({63, 1, 5120, 0});
+    cases.push_back({65, 1, 5120, 5});
+    cases.push_back({65, 1, 5120, 7});
+    for (int m : {64, 65}) { cases.push_back({m, 1, 5120, 6}); }
     const uint32_t magic[3] = {0x50545147, 1, static_cast<uint32_t>(cases.size())};
     write_bytes(output, magic, sizeof(magic));
     for (size_t i = 0; i < cases.size(); ++i) {
@@ -127,7 +141,7 @@ int main(int argc, char ** argv) {
         ggml_build_forward_expand(gf, out);
         ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
         GGML_ASSERT(buffer);
-        initialize(ctx, static_cast<int>(i));
+        initialize(ctx, static_cast<int>(i), c);
         for (int node = 0; node < ggml_graph_n_nodes(gf); ++node) {
             GGML_ASSERT(ggml_backend_supports_op(backend, ggml_graph_node(gf, node)));
         }
@@ -136,6 +150,12 @@ int main(int argc, char ** argv) {
             std::vector<float> values(ggml_nelements(out));
             ggml_backend_tensor_get(out, values.data(), 0, values.size() * sizeof(values[0]));
             for (float value : values) { GGML_ASSERT(std::isfinite(value)); }
+            if (c.kind == 6) {
+                for (int row = 0; row < c.m; ++row) {
+                    const float expected = (row & 1 ? -1.0f : 1.0f) * (127.0f / 128.0f) * (1 << (row % 3));
+                    GGML_ASSERT(std::memcmp(&values[row], &expected, sizeof(expected)) == 0);
+                }
+            }
             const uint32_t record[6] = {static_cast<uint32_t>(i), static_cast<uint32_t>(repetition),
                 static_cast<uint32_t>(c.m), static_cast<uint32_t>(c.n), static_cast<uint32_t>(c.k), static_cast<uint32_t>(c.kind)};
             write_bytes(output, record, sizeof(record));

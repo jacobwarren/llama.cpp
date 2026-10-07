@@ -1,0 +1,23 @@
+# Private sm120 PTQ SoA 16-lane study
+
+This private fork starts at W2 qualification pin `ca0816aeaf8eadcfc5d8e1b1f62e502e33ed634e`. The existing W2 worktree and production pins remain unchanged. This source draft has no build, numerical, launch, speed, memory or quality acceptance yet.
+
+Exactly `GGML_CUDA_PTQ1_0_SOA_LANES=16`, fixed before process startup, requests two rows per physical warp. Unset, empty, 0, 32, 016, 16x and other values use stock 32-lane rows. Backend feature `PTQ1_0_SOA_LANES_REQUEST` reports the request only. The existing literal `GGML_CUDA_PTQ1_0_SOA_WARPS=2` control still requests two physical warps; its default remains four.
+
+The new path requires plain PTQ/N1/SoA exact-isum, K5120, M>=64, runtime and compiled sm120, no ids, one channel/sample, contiguous packed weight rows/output and 32-byte-aligned weight/output bases. Every fusion pointer must be null. Small M, other K, bias/gate/scale fusion, planar/invariant, ids, noncontiguous or misaligned data and other architectures keep existing paths. An upstream FWHT quantizer may still feed an eligible plain consumer; quantizer/fusion ownership is unchanged.
+
+Each physical lane l=0..15 within a half warp owns two independent accumulators for stock logical lanes l and l+16. Both retain K-block increments of32. At40 blocks per row, the low accumulator handles l and, for l<8, l+32; the high handles l+16. `__fadd_rn` supplies the stock rounded XOR16 fold and prevents contracting it into the last block multiply-add. Existing width16 XOR8/4/2/1 then finishes the same tree. Invalid half rows skip reads/writes but participate in all shuffles with zero accumulators. Lanes0/16 write distinct output rows.
+
+The kernel template's default lane parameter is32. Lane16 doubles rows per CTA to2*nwarps; physical thread count and launch bounds stay32*nwarps. Host grids are ceil(M/8) for four warps and ceil(M/4) for two. PDL synchronization remains before reads, with the existing launcher, pool, stream and graph lifecycle. No new shared/partial/global buffer, repacking or persistent decoded weight copy is introduced.
+
+For two rows, the new mapping executes three helper rounds instead of four, with the same80 block dots. Active helper slots rise from62.5% to83.3%; this is an instruction scheduling opportunity, not a speedup prediction. K5120 packed rows are1120 bytes and16-block spans448 bytes. The alignment gate preserves these sector boundaries. Activation addresses duplicate across the two half rows, which may merge within the warp. Registers, instruction footprint, spills, actual memory transactions, thermal behavior and complete model timing need measurement.
+
+## Existing diagnostic extension
+
+`llama-ptq-geometry` retains its101 previous cases and adds five: M63 at the eligibility boundary; M65 padded rows; M65 with a28-byte weight-view offset; and two cancellation witnesses at M64/65. The resulting106 cases run three calls each:318 records,10908 float32 values and51276 bytes including headers. Kinds6/7 denote the cancellation witness and offset-weight fallback; existing kinds0..5 keep their meaning.
+
+The witness uses constant activation127, so production Q8 gives byte127 and scale1. Only K blocks0/16/32 have nonzero weight scales. Block0 contributes A=33292288, block32 contributes -A, and block16 contributes signed S=(127/128)*2^(row%3). Stock logical lane0 cancels A before the XOR16 fold; its partner contributes S. Expected per-row bits are checked independently. Combining the three contributions into one accumulator can lose/round S. Positive/negative rows, scale variation and the final lone half row are included. This does not inject raw Q8 -128.
+
+Qualification must use fresh selector controls with both physical-warp choices, prove unsupported paths stay old, and compare same-GPU outputs bitwise plus existing CPU-reference tolerances. Native SASS must preserve block-dot/accumulator arithmetic, an explicit rounded fold, width16 shuffles, bounds and zero new scratch/spills; actual kernel names, block/grid and graph replay must attest selection. Default32 should match the frozen W2 baseline. Capture source/binary/runtime identities and all failures. No result is claimed before these checks execute.
+
+Matched model controls follow only after qualification, under a Root-owned serial lease. They include complete quantization/FWHT/capture/attention/recurrent work, long context, greedy/cancellation continuity, host memory, raw device-wide VRAM and scoped window power. Current W2 gains were small; this separate study makes no speed, ZBook, per-watt or long-horizon promise. No ThunderKittens code, framework or ISA is imported.
