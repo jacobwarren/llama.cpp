@@ -4710,6 +4710,60 @@ struct test_ptq_lookup_witness : public test_mul_mat {
     }
 };
 
+struct test_ptq_lookup_stride : public test_mul_mat {
+    test_ptq_lookup_stride() : test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_Q8_0, 4, 1, 128, {1, 1}, {1, 1}) {}
+    std::string vars() override { return test_mul_mat::vars() + ",lookup_byte_stride=32"; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * storage = ggml_new_tensor_1d(ctx, GGML_TYPE_PTQ1_0, 5 * QK_PTQ1_0);
+        ggml_set_name(storage, "lookup_stride_storage");
+        ggml_tensor * a = ggml_view_2d(ctx, storage, QK_PTQ1_0, 4, 32, 0);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, QK_PTQ1_0, 1);
+        return ggml_mul_mat(ctx, a, b);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
+            if (strcmp(ggml_get_name(tensor), "lookup_stride_storage") != 0) { continue; }
+            std::vector<uint8_t> bytes(ggml_nbytes(tensor), 0xa5);
+            for (int row = 0; row < 4; ++row) {
+                block_ptq1_0 block = {};
+                block.d = ggml_fp32_to_fp16(0.0153f + 0.0307f * row);
+                for (size_t j = 0; j < sizeof(block.qs); ++j) { block.qs[j] = static_cast<uint8_t>(row * 83 + j * 17); }
+                for (size_t j = 0; j < sizeof(block.qh); ++j) { block.qh[j] = static_cast<uint8_t>(row * 47 + j * 37); }
+                memcpy(bytes.data() + row * 32, &block, sizeof(block));
+            }
+            ggml_backend_tensor_set(tensor, bytes.data(), 0, bytes.size());
+        }
+    }
+};
+
+struct test_ptq_lookup_perf : public test_mul_mat {
+    test_ptq_lookup_perf(int64_t k) : test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 5120, 1, k, {1, 1}, {1, 1}) {}
+    std::string vars() override { return test_mul_mat::vars() + ",lookup_perf=1"; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
+            if (tensor->type == GGML_TYPE_PTQ1_0) {
+                std::vector<block_ptq1_0> blocks(ggml_nelements(tensor) / QK_PTQ1_0);
+                for (size_t i = 0; i < blocks.size(); ++i) {
+                    blocks[i].d = ggml_fp32_to_fp16(0.0153f + 0.0307f * (i % 11));
+                    for (size_t j = 0; j < sizeof(blocks[i].qs); ++j) { blocks[i].qs[j] = static_cast<uint8_t>(i * 31 + j * 17); }
+                    for (size_t j = 0; j < sizeof(blocks[i].qh); ++j) { blocks[i].qh[j] = static_cast<uint8_t>(i * 23 + j * 37); }
+                }
+                ggml_backend_tensor_set(tensor, blocks.data(), 0, blocks.size() * sizeof(blocks[0]));
+            } else if (tensor->type == GGML_TYPE_F32) {
+                std::vector<float> values(ggml_nelements(tensor), 0.0f);
+                if (strcmp(ggml_get_name(tensor), "b") == 0) {
+                    for (size_t i = 0; i < values.size(); ++i) { values[i] = (static_cast<int>(i * 37 % 256) - 128) / 128.0f; }
+                }
+                ggml_backend_tensor_set(tensor, values.data(), 0, values.size() * sizeof(values[0]));
+            }
+        }
+    }
+};
+
 #define P 1.0f
 #define N -1.0f
 
@@ -9674,6 +9728,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 5, n, 5120, {2, 3}, {2, 1}, {0, 1, 2, 3}, 5248));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_Q8_0, 7, n, 5120, {2, 1}, {1, 2}));
     }
+    test_cases.emplace_back(new test_ptq_lookup_stride());
 
     // BF16 is absent from base_types: add the 3 standard non-contig permutations explicitly
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 16,  1, 256, {2, 3}, {1, 1}, {0, 2, 1, 3}));
@@ -10626,6 +10681,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    for (int k : {128, 5120, 6144, 17408}) { test_cases.emplace_back(new test_ptq_lookup_perf(k)); }
     // bandwidth comparison at Bonsai-2 shapes
     for (ggml_type t : {GGML_TYPE_PTQ1_0, GGML_TYPE_PQ2_0, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_TQ2_0}) {
         test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 17408, 1, 5120, {1, 1}, {1, 1}));

@@ -85,9 +85,11 @@ the integer entry requires four 32-byte code rows in 0..2, 32 Q8 bytes and two
 distinct 32-int32 output buffers. Production calls the core directly after
 the narrow gate, with no per-row environment checks.
 
-Existing backend tests add 140 cases: 84 row/K/type cases, 45 direct packed-byte
-N1 cases, 5 lane-order witnesses and 6 padded/plane/N2/N4 fallback controls.
-The expected filtered total is 613, including inherited 473 cases. Actual
+Existing backend tests add 141 cases: 84 row/K/type cases, 45 direct packed-byte
+N1 cases, 5 lane-order witnesses, 6 padded/plane/N2/N4 fallback controls and a
+32-byte PTQ row-stride view. That view has four bytes of padding beyond each
+28-byte block and checks the integer-lda fallback guard. The expected filtered
+total is 614, including inherited 473 cases. Actual
 match counts, zero-NMSE comparisons and selector execution must be confirmed
 after CPU release; no source-derived count is execution evidence.
 
@@ -97,7 +99,7 @@ Build the same Clang Release/native-pool configuration as the signed reference,
 with explicit signed build support, and retain source/binary/cache identities.
 Run separate-process LUT unset/0/other/1 controls plus original/signed tail
 selectors and compact controls. Verify exact active metadata and candidate
-integer count, the bitwise witness/mixed-scale comparisons and actual 613-case
+integer count, the bitwise witness/mixed-scale comparisons and actual 614-case
 matrix matches. Also build the no-llamafile/unavailable branch as practical.
 Inspect full table-preparation/decode/compute assembly for calls, scratch,
 spills, byte-plane mapping, lane order and FMA/reduction order. Measure complete
@@ -105,4 +107,9 @@ prepare+compute against original and signed row dots before any model claim.
 Only the current Intel host is available; AMD/macOS runtime and performance
 are unmeasured. Root owns subsequent serial model quality, cancellation and
 throughput comparisons. This candidate may be rejected if its complete cost
-exceeds the row-dot controls.
+exceeds the row-dot controls. Four tagged cases in the existing backend perf
+suite use M=5120,N=1 and K=128/5120/6144/17408 with identical deterministic
+packed weights and F32 activations across processes. Their full graph timing
+includes Q8 conversion and all lookup stages, with the suite's existing
+hardware-concurrency worker count. Warmup/initial tensor creation are excluded
+by that framework. This is a model-free matmul comparison, not model throughput.
