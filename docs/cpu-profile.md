@@ -109,11 +109,11 @@ tests (no new test framework):
 
 ```powershell
 $env:GGML_CPU_PROFILE = '1'
-& .\build-profile\bin\Release\test-quantize-fns.exe
-& .\build-profile\bin\Release\test-backend-ops.exe test -b CPU -o MUL_MAT -p 'ptq1_0'
-& .\build-profile\bin\Release\test-backend-ops.exe test -b CPU -o 'RMS_NORM_MUL_ADD,RMS_NORM_MUL_ROPE'
-& .\build-profile\bin\Release\test-backend-ops.exe test -b CPU -o MUL_MAT_HADAMARD
-& .\build-profile\bin\Release\test-backend-ops.exe test -b CPU -o 'GATED_DELTA_NET,FLASH_ATTN_EXT'
+& .\build-profile\bin\test-quantize-fns.exe
+& .\build-profile\bin\test-backend-ops.exe test -b CPU -o MUL_MAT -p 'ptq1_0'
+& .\build-profile\bin\test-backend-ops.exe test -b CPU -o 'RMS_NORM_MUL_ADD,RMS_NORM_MUL_ROPE'
+& .\build-profile\bin\test-backend-ops.exe test -b CPU -o MUL_MAT_HADAMARD
+& .\build-profile\bin\test-backend-ops.exe test -b CPU -o 'GATED_DELTA_NET,FLASH_ATTN_EXT'
 ```
 
 Verify nonzero matched cases for each selection. Run PTQ tests with compact
@@ -141,16 +141,16 @@ existing direct-CPU target requires `LLAMA_BUILD_TESTS=ON` and
 ```powershell
 cmake --build build-profile --config Release --target test-barrier --parallel 2
 $env:GGML_CPU_PROFILE = '1'
-& .\build-profile\bin\Release\test-barrier.exe --cpu-profile-edges 2 2> profile-edges-on.log
+& .\build-profile\bin\test-barrier.exe --cpu-profile-edges 2 2> profile-edges-on.log
 $env:GGML_CPU_DISABLE_FUSION = '1'
-& .\build-profile\bin\Release\test-barrier.exe --cpu-profile-edges 2 2> profile-edges-unfused.log
+& .\build-profile\bin\test-barrier.exe --cpu-profile-edges 2 2> profile-edges-unfused.log
 Remove-Item Env:GGML_CPU_DISABLE_FUSION
 $env:GGML_CPU_PROFILE = '0'
-& .\build-profile\bin\Release\test-barrier.exe --cpu-profile-edges 2 2> profile-edges-off.log
+& .\build-profile\bin\test-barrier.exe --cpu-profile-edges 2 2> profile-edges-off.log
 $env:GGML_CPU_PROFILE = 'other'
-& .\build-profile\bin\Release\test-barrier.exe --cpu-profile-edges 2 2> profile-edges-other.log
+& .\build-profile\bin\test-barrier.exe --cpu-profile-edges 2 2> profile-edges-other.log
 Remove-Item Env:GGML_CPU_PROFILE
-& .\build-profile\bin\Release\test-barrier.exe --cpu-profile-edges 1 2> profile-edges-unset.log
+& .\build-profile\bin\test-barrier.exe --cpu-profile-edges 1 2> profile-edges-unset.log
 ```
 
 Run each process with a controller deadline (for example 60 seconds) so a
@@ -159,6 +159,47 @@ seven complete graphs, with one aborted graph and one successful graph having
 4096 recorded rows and five dropped executions. The Rig analyzer must see
 seven graphs and include five, excluding the abort and truncation. Disabled
 configurations must emit zero profile records. Allocation-failure injection
-is not covered by this driver. The source has not been compiled or run yet;
-static review and `git diff --check` do not establish Windows or macOS runtime
-behavior or profiling overhead.
+is not covered by this driver. The paths above use single-config Ninja;
+multi-config generators can put executables in `bin/Release`.
+
+## Windows validation
+
+The source/edge checks at `1f74c02ed4f40f35728cd91625f55a0425841b3a` were built
+with MSVC 19.44.35229, Ninja, Release, shared libraries, native AVX2 + AVX_VNNI,
+OpenMP and llamafile. CUDA and dynamic backend loading were disabled. The
+build targets were llama-bench, test-quantize-fns, test-backend-ops and
+test-barrier; no model or inference benchmark was run during these checks.
+
+Evidence is retained in the sibling Rig checkout at
+`artifacts/bonsai-cpu/20261006/profile-validation/`: exact commands, configuration
+and build logs, binary/DLL SHA-256 provenance, raw stdout/stderr and parsed
+profile summaries. Numerical runs use the existing independent CPU reference.
+
+| Check | Verified result |
+|---|---|
+| Quantization and PTQ stress | 0 failures |
+| PTQ MUL_MAT, profiling off; compact toggle unset | 291/291 |
+| PTQ MUL_MAT, profiling on; compact toggle unset, 0, 1 | 291/291 in each separate process |
+| Bounded FWHT selection | 17/17 |
+| RMS_NORM/MUL/ADD and RMS_NORM/MUL/ROPE | 174/174 |
+| Bounded GDN decode/prefill selection | 18/18 |
+| Anchored mixed-type attention selection, profiling off/on | 3/3 in each process |
+| Seven-case edge mode, profile unset, 0, other, 1; fusion off | All pass within the 60-second controller deadline |
+
+PTQ on/unset and on/0 emit only vec-dot routes. On/1 additionally emits the
+successful compact native/converted routes. All enabled complete logs pass
+graph/node timing reconciliation. Enabled edge logs each contain seven graphs;
+the analyzer includes five and excludes the aborted/truncated graphs. Both
+fused and unfused numerical outputs pass the scalar reference.
+
+The first attention filter used a negated bracket class and exited with
+`0xC0000409` before emitting profile rows. Its failure is retained in `run1`;
+`run2` uses `^hsk=64,hsv=64,nh=4,nr23=\[1,1\],kv=(96|128),nb=2,` and passes with
+profiling off and on. The broader selection remains unverified; this slice
+does not claim its failure was caused by profiling or fix unrelated test
+harness behavior. No native source correction was needed for the passing checks.
+
+Allocation-failure injection, native-pool mode with OpenMP disabled, macOS
+runtime behavior, real-model decode/prefill attribution, and profiling-off/on
+end-to-end overhead remain separate unverified acceptance work. These Windows
+numeric/edge checks establish no performance improvement.
