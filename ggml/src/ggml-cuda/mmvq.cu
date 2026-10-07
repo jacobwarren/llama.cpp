@@ -1,11 +1,23 @@
 #include "mmvq.cuh"
 #include "mmvq-ptq1_0.cuh"
+
+#include <cstdlib>
+#include <cstring>
+
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
 
 #include <cstdint>
 #include <type_traits>
+
+int ggml_cuda_ptq1_0_soa_warps_request() {
+    static const int requested = [] {
+        const char * value = std::getenv("GGML_CUDA_PTQ1_0_SOA_WARPS");
+        return value && std::strcmp(value, "2") == 0 ? 2 : 4;
+    }();
+    return requested;
+}
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
@@ -572,8 +584,8 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
 
 // y_soa: PTQ1_0 one-column activations are in the warp-transposed exact-isum layout (see
 // ggml_cuda_q8_1_layout_for). Only ever instantiated true for type == PTQ1_0 && ncols_dst == 1.
-template <ggml_type type, int ncols_dst, bool has_fusion, bool has_gate, bool small_k = false, bool halve_iters = false, bool y_soa = false>
-__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
+template <ggml_type type, int ncols_dst, bool has_fusion, bool has_gate, bool small_k = false, bool halve_iters = false, bool y_soa = false, int soa_warps = 0>
+__launch_bounds__((soa_warps ? soa_warps : calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters))*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -590,8 +602,9 @@ static __global__ void mul_mat_vec_q(
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
-    constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
+    static_assert(soa_warps == 0 || (soa_warps == 2 && type == GGML_TYPE_PTQ1_0 && ncols_dst == 1 && small_k && y_soa), "restricted PTQ SoA geometry");
+    constexpr int nwarps = soa_warps ? soa_warps : calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
+    constexpr int rows_per_cuda_block = soa_warps ? soa_warps : calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
@@ -1122,9 +1135,16 @@ static std::pair<dim3, dim3> calc_launch_params(
 // Resolves the runtime SoA decision to the y_soa template parameter. The true instantiation exists
 // only for PTQ1_0 at one column, so every other type/column count compiles exactly one kernel body.
 template<ggml_type type, int c_ncols_dst, bool has_fusion, bool has_gate, bool small_k, bool halve_iters, typename... Args>
-static void mul_mat_vec_q_launch(const bool y_soa, const ggml_cuda_kernel_launch_params & launch_params, Args&&... args) {
+static void mul_mat_vec_q_launch(const bool y_soa, const bool soa_w2, const ggml_cuda_kernel_launch_params & launch_params, Args&&... args) {
     if constexpr (type == GGML_TYPE_PTQ1_0 && c_ncols_dst == 1) {
         if (y_soa) {
+            if constexpr (small_k) {
+                if (soa_w2) {
+                    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, has_fusion, has_gate, small_k, halve_iters, true, 2>,
+                                           launch_params, std::forward<Args>(args)...);
+                    return;
+                }
+            }
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, has_fusion, has_gate, small_k, halve_iters, true>,
                                     launch_params, std::forward<Args>(args)...);
             return;
@@ -1144,7 +1164,7 @@ static void mul_mat_vec_q_switch_fusion(
         const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
         const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
         const dim3 & block_nums, const dim3 & block_dims, const int nbytes_shared,
-        const uint32_t ids_stride, const bool y_soa, cudaStream_t stream) {
+        const uint32_t ids_stride, const bool y_soa, cudaStream_t stream, const bool soa_w2 = false) {
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
@@ -1152,12 +1172,12 @@ static void mul_mat_vec_q_switch_fusion(
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
             if (fusion.gate != nullptr) {
-                mul_mat_vec_q_launch<type, c_ncols_dst, true, true, small_k, halve_iters>(y_soa, launch_params,
+                mul_mat_vec_q_launch<type, c_ncols_dst, true, true, small_k, halve_iters>(y_soa, soa_w2, launch_params,
                      vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                      channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                      sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
             } else {
-                mul_mat_vec_q_launch<type, c_ncols_dst, true, false, small_k, halve_iters>(y_soa, launch_params,
+                mul_mat_vec_q_launch<type, c_ncols_dst, true, false, small_k, halve_iters>(y_soa, soa_w2, launch_params,
                      vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                      channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                      sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
@@ -1169,7 +1189,7 @@ static void mul_mat_vec_q_switch_fusion(
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-    mul_mat_vec_q_launch<type, c_ncols_dst, false, false, small_k, halve_iters>(y_soa, launch_params,
+    mul_mat_vec_q_launch<type, c_ncols_dst, false, false, small_k, halve_iters>(y_soa, soa_w2, launch_params,
         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
@@ -1338,11 +1358,22 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
                 std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
                                                                       nsamples_dst, warp_size, table_id, c_small_k, c_halve_iters);
+                bool soa_w2 = false;
+                if constexpr (type == GGML_TYPE_PTQ1_0 && c_ncols_dst == 1 && c_small_k) {
+                    soa_w2 = y_soa && !has_ids && cc == GGML_CUDA_CC_BLACKWELL &&
+                        ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_BLACKWELL &&
+                        nchannels_dst == 1 && nsamples_dst == 1 && stride_row_x == blocks_per_row_x &&
+                        stride_col_dst == nrows_x && ggml_cuda_ptq1_0_soa_warps_request() == 2;
+                    if (soa_w2) {
+                        dims.first.x = (static_cast<int64_t>(nrows_x) + 1) / 2;
+                        dims.second.y = 2;
+                    }
+                }
                 mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, c_halve_iters>(
                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
                     stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride, y_soa,
-                    stream);
+                    stream, soa_w2);
             };
 
             if (should_use_small_k(c_ncols_dst)) {
