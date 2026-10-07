@@ -12,6 +12,19 @@ constexpr uint64_t SERVER_CHECKPOINT_BUNDLE_MAX_BYTES = UINT64_C(2) * 1024 * 102
 constexpr uint64_t SERVER_CHECKPOINT_BUNDLE_MAX_CHECKPOINT_BYTES = UINT64_C(256) * 1024 * 1024;
 constexpr size_t SERVER_CHECKPOINT_BUNDLE_MAX_TOKENS = 32768;
 
+struct server_checkpoint_bundle_timings {
+    double model_fingerprint_ms = 0;
+    bool model_fingerprint_cached = false;
+    double endpoint_save_ms = 0;
+    double checkpoint_write_ms = 0;
+    double endpoint_fingerprint_ms = 0;
+    double checkpoint_fingerprint_ms = 0;
+    double checkpoint_read_ms = 0;
+    double structural_preflight_ms = 0;
+    double manifest_publish_ms = 0;
+    double native_restore_ms = 0;
+};
+
 struct server_checkpoint_bundle_file_closer {
     void operator()(FILE * file) const { if (file) { std::fclose(file); } }
 };
@@ -53,7 +66,9 @@ size_t server_checkpoint_bundle_save(
         const server_tokens & tokens,
         const common_prompt_checkpoint & checkpoint,
         llama_context * ctx,
-        llama_seq_id seq_id);
+        llama_seq_id seq_id,
+        server_checkpoint_bundle_timings * timings = nullptr);
 
 // Validates the complete envelope without modifying a native context.
-server_checkpoint_bundle server_checkpoint_bundle_read(const std::string & directory, const json & identity);
+server_checkpoint_bundle server_checkpoint_bundle_read(const std::string & directory, const json & identity,
+        server_checkpoint_bundle_timings * timings = nullptr);

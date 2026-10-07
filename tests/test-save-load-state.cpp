@@ -10,12 +10,87 @@
 
 #ifdef LLAMA_TEST_CHECKPOINT_BUNDLE
 #include "../tools/server/server-checkpoint-bundle.h"
+#include "../tools/server/server-task.h"
+#include "../tools/server/platform/checkpoint-bundle.h"
+#include "../vendor/hash/hash.h"
 
 #include <array>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
+
+static void test_checkpoint_bundle_hashes() {
+    const auto streamed = [](const std::vector<uint8_t> & bytes, size_t chunk) {
+        server_checkpoint_bundle_sha256 state;
+        state.update(nullptr, 0);
+        for (size_t offset = 0; offset < bytes.size();) {
+            const auto count = std::min(chunk, bytes.size() - offset);
+            state.update(bytes.data() + offset, count);
+            offset += count;
+        }
+        const auto digest = state.finish();
+        static const char hex[] = "0123456789abcdef";
+        std::string result;
+        for (const auto byte : digest) {
+            result += hex[byte >> 4];
+            result += hex[byte & 15];
+        }
+        return result;
+    };
+    const auto known = [&](const std::vector<uint8_t> & bytes, const char * expected) {
+        if (streamed(bytes, 65536) != expected || hash_sha256_hex(bytes.data(), bytes.size()) != expected) {
+            throw std::runtime_error("SHA-256 known-vector mismatch");
+        }
+    };
+    known({}, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    known({'a', 'b', 'c'}, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    known(std::vector<uint8_t>(1000000, 'a'), "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+    uint32_t random = 0x51a256;
+    for (const size_t size : {0, 1, 55, 56, 63, 64, 65, 127, 128, 129, 65535, 65536, 65537, 1048583}) {
+        std::vector<uint8_t> bytes(size);
+        for (auto & byte : bytes) {
+            random ^= random << 13;
+            random ^= random >> 17;
+            random ^= random << 5;
+            byte = static_cast<uint8_t>(random);
+        }
+        const auto expected = hash_sha256_hex(bytes.data(), bytes.size());
+        for (const size_t chunk : {1, 31, 63, 64, 65, 4096, 65536, 262144}) {
+            if (size > 4096 && chunk < 64) {
+                continue;
+            }
+            if (streamed(bytes, chunk) != expected) {
+                throw std::runtime_error("SHA-256 random/chunk-boundary mismatch");
+            }
+        }
+        LOG("SHA-256 %s fixture size=%zu digest=%s\n", server_checkpoint_bundle_sha256_backend(), size, expected.c_str());
+    }
+    server_task_result_slot_save_load result;
+    result.id_slot = 0;
+    result.filename = "fixture.bundle";
+    result.is_save = true;
+    result.n_tokens = 64;
+    result.n_bytes = 1;
+    result.t_ms = 17;
+    result.checkpoint_bundle = true;
+    result.bundle_timings.model_fingerprint_ms = 10;
+    result.bundle_timings.endpoint_fingerprint_ms = 2;
+    result.bundle_timings.checkpoint_fingerprint_ms = 3;
+    const auto response = result.to_json();
+    if (response.at("sha256_backend") != server_checkpoint_bundle_sha256_backend() ||
+            response.at("timings").at("model_fingerprint_ms").get<double>() != 10 ||
+            response.at("timings").at("model_fingerprint_cached").get<bool>() ||
+            response.at("timings").at("endpoint_fingerprint_ms").get<double>() != 2 ||
+            response.at("timings").at("checkpoint_fingerprint_ms").get<double>() != 3) {
+        throw std::runtime_error("Checkpoint bundle timing metadata differs");
+    }
+    result.checkpoint_bundle = false;
+    const auto legacy = result.to_json();
+    if (legacy.contains("sha256_backend") || legacy.at("timings").contains("model_fingerprint_ms")) {
+        throw std::runtime_error("Legacy slot timing metadata changed");
+    }
+}
 
 static void test_checkpoint_bundle_profiles() {
     common_params supported_params;
@@ -88,9 +163,10 @@ static void test_checkpoint_bundle_profiles() {
 static int test_checkpoint_bundle_envelope() {
     ggml_time_init();
     try {
+        test_checkpoint_bundle_hashes();
         test_checkpoint_bundle_profiles();
     } catch (const std::exception & error) {
-        LOG_ERR("Checkpoint bundle profile test failed: %s\n", error.what());
+        LOG_ERR("Checkpoint bundle hash/profile test failed: %s\n", error.what());
         return 1;
     }
     namespace fs = std::filesystem;

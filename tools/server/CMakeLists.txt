@@ -36,6 +36,9 @@ endif()
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT} PRIVATE vendor::hash)
+if (WIN32)
+    target_link_libraries(${TARGET} PRIVATE bcrypt)
+endif()
 
 # llama-server-impl: server logic, reusable by app
 

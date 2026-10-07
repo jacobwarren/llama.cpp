@@ -1,4 +1,5 @@
 #include "server-task.h"
+#include "platform/checkpoint-bundle.h"
 
 #include "build-info.h"
 #include "server-chat.h"
@@ -1625,7 +1626,20 @@ json server_task_result_slot_save_load::to_json() {
             { "id_slot", id_slot }, { "filename", filename }, { "checkpoint_bundle", true },
             { is_save ? "n_saved" : "n_restored", n_tokens }, { is_save ? "n_written" : "n_read", n_bytes },
             { "checkpoint_tokens", checkpoint_tokens },
-            { "timings", {{ is_save ? "save_ms" : "restore_ms", t_ms }} },
+            { "sha256_backend", server_checkpoint_bundle_sha256_backend() },
+            { "timings", {
+                { is_save ? "save_ms" : "restore_ms", t_ms },
+                { "model_fingerprint_ms", bundle_timings.model_fingerprint_ms },
+                { "model_fingerprint_cached", bundle_timings.model_fingerprint_cached },
+                { "endpoint_save_ms", bundle_timings.endpoint_save_ms },
+                { "checkpoint_write_ms", bundle_timings.checkpoint_write_ms },
+                { "endpoint_fingerprint_ms", bundle_timings.endpoint_fingerprint_ms },
+                { "checkpoint_fingerprint_ms", bundle_timings.checkpoint_fingerprint_ms },
+                { "checkpoint_read_ms", bundle_timings.checkpoint_read_ms },
+                { "structural_preflight_ms", bundle_timings.structural_preflight_ms },
+                { "manifest_publish_ms", bundle_timings.manifest_publish_ms },
+                { "native_restore_ms", bundle_timings.native_restore_ms },
+            }},
         };
     }
     if (is_save) {

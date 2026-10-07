@@ -10,6 +10,7 @@
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
+#include "server-checkpoint-bundle.h"
 
 
 enum server_task_type {
@@ -528,6 +529,7 @@ struct server_task_result_slot_save_load : server_task_result {
     double t_ms;
     bool checkpoint_bundle = false;
     int64_t checkpoint_tokens = 0;
+    server_checkpoint_bundle_timings bundle_timings;
 
     virtual json to_json() override;
 };

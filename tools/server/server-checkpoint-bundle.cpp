@@ -3,11 +3,6 @@
 #include "src/llama-model.h"
 #include "speculative.h"
 
-#include "hash/hash.h"
-extern "C" {
-#include "hash/sha256/sha256.h"
-}
-
 #include <array>
 #include <cstring>
 #include <filesystem>
@@ -159,8 +154,8 @@ void check_native_endpoint(FILE * input, uint64_t bytes, const json & layout, in
 std::string digest_hex(const unsigned char * digest) {
     static const char digits[] = "0123456789abcdef";
     std::string result;
-    result.reserve(SHA256_DIGEST_SIZE * 2);
-    for (size_t i = 0; i < SHA256_DIGEST_SIZE; ++i) {
+    result.reserve(32 * 2);
+    for (size_t i = 0; i < 32; ++i) {
         result += digits[digest[i] >> 4];
         result += digits[digest[i] & 15];
     }
@@ -168,12 +163,9 @@ std::string digest_hex(const unsigned char * digest) {
 }
 
 std::string hash_bytes(const std::vector<uint8_t> & bytes) {
-    sha256_t state;
-    sha256_init(&state);
-    sha256_update(&state, bytes.data(), bytes.size());
-    unsigned char digest[SHA256_DIGEST_SIZE];
-    sha256_final(&state, digest);
-    return digest_hex(digest);
+    server_checkpoint_bundle_sha256 state;
+    state.update(bytes.data(), bytes.size());
+    return digest_hex(state.finish().data());
 }
 
 server_checkpoint_bundle_file open_endpoint(const fs::path & path, const json & info, uint64_t expected) {
@@ -184,8 +176,7 @@ server_checkpoint_bundle_file open_endpoint(const fs::path & path, const json & 
     require(file != nullptr, "Unable to retain checkpoint bundle endpoint");
     // The native Windows reader uses the OS handle, so it must share an unbuffered CRT stream.
     require(std::setvbuf(file.get(), nullptr, _IONBF, 0) == 0, "Unable to configure checkpoint bundle endpoint");
-    sha256_t state;
-    sha256_init(&state);
+    server_checkpoint_bundle_sha256 state;
     std::array<unsigned char, 64 * 1024> buffer;
     uint64_t total = 0;
     if (copy_source) {
@@ -196,7 +187,7 @@ server_checkpoint_bundle_file open_endpoint(const fs::path & path, const json & 
             require(count >= 0 && static_cast<uint64_t>(count) <= expected - total, "Bundle endpoint changed while snapshotting");
             total += static_cast<uint64_t>(count);
             require(std::fwrite(buffer.data(), 1, static_cast<size_t>(count), file.get()) == static_cast<size_t>(count), "Unable to write endpoint snapshot");
-            sha256_update(&state, buffer.data(), static_cast<size_t>(count));
+            state.update(buffer.data(), static_cast<size_t>(count));
         }
         require(source.eof() && !source.bad() && std::fflush(file.get()) == 0, "Unable to snapshot complete bundle endpoint");
     } else {
@@ -204,7 +195,7 @@ server_checkpoint_bundle_file open_endpoint(const fs::path & path, const json & 
             const auto count = std::fread(buffer.data(), 1, buffer.size(), file.get());
             require(count <= expected - total, "Bundle endpoint changed while hashing");
             total += count;
-            sha256_update(&state, buffer.data(), count);
+            state.update(buffer.data(), count);
             if (count < buffer.size()) {
                 require(std::feof(file.get()) && !std::ferror(file.get()), "Unable to hash complete bundle endpoint");
                 break;
@@ -212,9 +203,7 @@ server_checkpoint_bundle_file open_endpoint(const fs::path & path, const json & 
         }
     }
     require(total == expected, "Truncated checkpoint bundle endpoint");
-    unsigned char digest[SHA256_DIGEST_SIZE];
-    sha256_final(&state, digest);
-    require(info.at("sha256") == digest_hex(digest), "Checkpoint bundle endpoint checksum mismatch");
+    require(info.at("sha256") == digest_hex(state.finish().data()), "Checkpoint bundle endpoint checksum mismatch");
     require(std::fseek(file.get(), 0, SEEK_SET) == 0, "Unable to rewind checkpoint bundle endpoint");
     return file;
 }
@@ -284,8 +273,7 @@ std::string server_checkpoint_bundle_hash_file(const std::string & path, uint64_
     const auto file_path = fs::u8path(path);
     const auto expected = regular_file_size(file_path, max_bytes);
     std::ifstream input(file_path, std::ios::binary);
-    sha256_t state;
-    sha256_init(&state);
+    server_checkpoint_bundle_sha256 state;
     std::array<unsigned char, 64 * 1024> buffer;
     uint64_t total = 0;
     while (input) {
@@ -293,12 +281,10 @@ std::string server_checkpoint_bundle_hash_file(const std::string & path, uint64_
         const auto count = input.gcount();
         require(count >= 0 && static_cast<uint64_t>(count) <= expected - total, "Bundle file changed while hashing");
         total += static_cast<uint64_t>(count);
-        sha256_update(&state, buffer.data(), static_cast<size_t>(count));
+        state.update(buffer.data(), static_cast<size_t>(count));
     }
     require(input.eof() && !input.bad() && total == expected, "Unable to hash complete checkpoint bundle file");
-    unsigned char digest[SHA256_DIGEST_SIZE];
-    sha256_final(&state, digest);
-    return digest_hex(digest);
+    return digest_hex(state.finish().data());
 }
 
 void server_checkpoint_bundle_check_profile(const common_params & params, const server_checkpoint_bundle_runtime_profile & runtime) {
@@ -399,7 +385,8 @@ size_t server_checkpoint_bundle_save(
         const server_tokens & tokens,
         const common_prompt_checkpoint & checkpoint,
         llama_context * ctx,
-        llama_seq_id seq_id) {
+        llama_seq_id seq_id,
+        server_checkpoint_bundle_timings * timings) {
     const fs::path destination = fs::u8path(directory);
     require(bundle_name(destination), "Checkpoint bundle filename must end in .bundle");
     require(fs::symlink_status(destination).type() == fs::file_type::not_found, "Checkpoint bundle already exists; use a fresh filename");
@@ -427,18 +414,37 @@ size_t server_checkpoint_bundle_save(
 
     try {
         const auto endpoint = staging / "endpoint.ggsq";
+        auto stage_start = ggml_time_us();
         const auto nwrite = llama_state_seq_save_file(ctx, endpoint.u8string().c_str(), seq_id,
                 reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
         require(nwrite == endpoint_bytes, "Unable to save complete bundle endpoint");
+        if (timings) {
+            timings->endpoint_save_ms = (ggml_time_us() - stage_start) / 1000.0;
+        }
+        stage_start = ggml_time_us();
         write_file(staging / "checkpoint.bin", checkpoint.data_tgt.data(), checkpoint.data_tgt.size());
+        if (timings) {
+            timings->checkpoint_write_ms = (ggml_time_us() - stage_start) / 1000.0;
+        }
+        stage_start = ggml_time_us();
+        const auto endpoint_info = payload_info(endpoint, SERVER_CHECKPOINT_BUNDLE_MAX_BYTES);
+        if (timings) {
+            timings->endpoint_fingerprint_ms = (ggml_time_us() - stage_start) / 1000.0;
+        }
+        stage_start = ggml_time_us();
+        const auto checkpoint_info = payload_info(staging / "checkpoint.bin", SERVER_CHECKPOINT_BUNDLE_MAX_CHECKPOINT_BYTES);
+        if (timings) {
+            timings->checkpoint_fingerprint_ms = (ggml_time_us() - stage_start) / 1000.0;
+        }
+        stage_start = ggml_time_us();
         const json manifest = {
             {"format", "rig-checkpoint-bundle"}, {"version", 1}, {"identity", identity},
             {"source_slot", seq_id}, {"token_ids", tokens.get_tokens()},
-            {"endpoint", payload_info(endpoint, SERVER_CHECKPOINT_BUNDLE_MAX_BYTES)},
+            {"endpoint", endpoint_info},
             {"checkpoint", {
                 {"n_tokens", checkpoint.n_tokens}, {"pos_min", checkpoint.pos_min}, {"pos_max", checkpoint.pos_max},
                 {"flags", LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY},
-                {"payload", payload_info(staging / "checkpoint.bin", SERVER_CHECKPOINT_BUNDLE_MAX_CHECKPOINT_BYTES)},
+                {"payload", checkpoint_info},
             }},
         };
         const auto text = manifest.dump();
@@ -446,6 +452,9 @@ size_t server_checkpoint_bundle_save(
         write_file(staging / "manifest.json", text.data(), text.size());
         require(fs::symlink_status(destination).type() == fs::file_type::not_found, "Checkpoint bundle destination appeared during save");
         fs::rename(staging, destination);
+        if (timings) {
+            timings->manifest_publish_ms = (ggml_time_us() - stage_start) / 1000.0;
+        }
         return static_cast<size_t>(endpoint_bytes + checkpoint.data_tgt.size() + text.size());
     } catch (...) {
         std::error_code error;
@@ -454,7 +463,8 @@ size_t server_checkpoint_bundle_save(
     }
 }
 
-server_checkpoint_bundle server_checkpoint_bundle_read(const std::string & directory, const json & identity) {
+server_checkpoint_bundle server_checkpoint_bundle_read(const std::string & directory, const json & identity,
+        server_checkpoint_bundle_timings * timings) {
     const fs::path root = fs::u8path(directory);
     check_local_entry(root.parent_path());
     check_local_entry(root);
@@ -498,14 +508,31 @@ server_checkpoint_bundle server_checkpoint_bundle_read(const std::string & direc
     require(endpoint_bytes <= SERVER_CHECKPOINT_BUNDLE_MAX_BYTES - checkpoint_bytes - manifest_bytes, "Checkpoint bundle byte limit exceeded");
     require(checkpoint_bytes == regular_file_size(root / "checkpoint.bin", SERVER_CHECKPOINT_BUNDLE_MAX_CHECKPOINT_BYTES), "Checkpoint bundle payload size mismatch");
 
+    auto stage_start = ggml_time_us();
     result.checkpoint.data_tgt.resize(static_cast<size_t>(checkpoint_bytes));
     std::ifstream checkpoint_input(root / "checkpoint.bin", std::ios::binary);
     read_exact(checkpoint_input, result.checkpoint.data_tgt.data(), result.checkpoint.data_tgt.size());
+    if (timings) {
+        timings->checkpoint_read_ms = (ggml_time_us() - stage_start) / 1000.0;
+    }
+    stage_start = ggml_time_us();
     require(saved.at("payload").at("sha256").is_string() && saved.at("payload").at("sha256") == hash_bytes(result.checkpoint.data_tgt), "Checkpoint bundle payload checksum mismatch");
+    if (timings) {
+        timings->checkpoint_fingerprint_ms = (ggml_time_us() - stage_start) / 1000.0;
+    }
+    stage_start = ggml_time_us();
     check_checkpoint(result.checkpoint, tokens.size(), source_slot, identity.at("layout").at("model_layers").get<uint32_t>());
     check_native_checkpoint(result.checkpoint, identity.at("layout").at("native_state"), source_slot);
+    if (timings) {
+        timings->structural_preflight_ms = (ggml_time_us() - stage_start) / 1000.0;
+    }
 
+    stage_start = ggml_time_us();
     result.endpoint_file = open_endpoint(root / "endpoint.ggsq", manifest.at("endpoint"), endpoint_bytes);
+    if (timings) {
+        timings->endpoint_fingerprint_ms = (ggml_time_us() - stage_start) / 1000.0;
+    }
+    stage_start = ggml_time_us();
     std::array<uint32_t, 3> header;
     require(std::fread(header.data(), 1, sizeof(header), result.endpoint_file.get()) == sizeof(header), "Truncated checkpoint bundle endpoint header");
     const auto packed = result.tokens.serialize();
@@ -517,6 +544,9 @@ server_checkpoint_bundle server_checkpoint_bundle_read(const std::string & direc
     check_native_endpoint(result.endpoint_file.get(), endpoint_bytes - sizeof(header) - packed.size(),
             identity.at("layout").at("native_state"), source_slot, tokens.size());
     require(std::fseek(result.endpoint_file.get(), 0, SEEK_SET) == 0, "Unable to rewind validated bundle endpoint");
+    if (timings) {
+        timings->structural_preflight_ms += (ggml_time_us() - stage_start) / 1000.0;
+    }
     result.n_bytes = static_cast<size_t>(endpoint_bytes + checkpoint_bytes + manifest_bytes);
     return result;
 }

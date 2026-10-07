@@ -2330,7 +2330,7 @@ private:
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
     }
 
-    json checkpoint_bundle_identity(const server_slot & slot) {
+    json checkpoint_bundle_identity(const server_slot & slot, server_checkpoint_bundle_timings & timings) {
         char arch[64] = {};
         llama_model_meta_val_str(model_tgt, "general.architecture", arch, sizeof(arch));
         char split_count[32] = {};
@@ -2344,8 +2344,11 @@ private:
                 std::filesystem::last_write_time(checkpoint_model_source) != checkpoint_model_mtime) {
             throw std::runtime_error("Model source changed or is unavailable; restart before using checkpoint bundles");
         }
+        timings.model_fingerprint_cached = !checkpoint_model_sha256.empty();
         if (checkpoint_model_sha256.empty()) {
+            const auto fingerprint_start = ggml_time_us();
             checkpoint_model_sha256 = server_checkpoint_bundle_hash_file(checkpoint_model_source.u8string(), checkpoint_model_bytes);
+            timings.model_fingerprint_ms = (ggml_time_us() - fingerprint_start) / 1000.0;
             if (std::filesystem::file_size(checkpoint_model_source) != checkpoint_model_bytes ||
                     std::filesystem::last_write_time(checkpoint_model_source) != checkpoint_model_mtime) {
                 checkpoint_model_sha256.clear();
@@ -2574,7 +2577,8 @@ private:
 
                     if (task.slot_action.checkpoint_bundle) {
                         try {
-                            const auto identity = checkpoint_bundle_identity(*slot);
+                            server_checkpoint_bundle_timings timings;
+                            const auto identity = checkpoint_bundle_identity(*slot, timings);
                             const auto checkpoint = std::find_if(slot->prompt.checkpoints.rbegin(), slot->prompt.checkpoints.rend(),
                                     [&](const common_prompt_checkpoint & cur) {
                                         return cur.n_tokens > 0 && cur.n_tokens < slot->prompt.n_tokens() && cur.pos_max == cur.n_tokens - 1;
@@ -2585,7 +2589,7 @@ private:
                             if (llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id) != slot->prompt.n_tokens() - 1) {
                                 throw std::runtime_error("Slot tokens do not match the native endpoint boundary");
                             }
-                            const auto nwrite = server_checkpoint_bundle_save(filepath, identity, slot->prompt.tokens, *checkpoint, ctx_tgt, slot->id);
+                            const auto nwrite = server_checkpoint_bundle_save(filepath, identity, slot->prompt.tokens, *checkpoint, ctx_tgt, slot->id, &timings);
                             auto res = std::make_unique<server_task_result_slot_save_load>();
                             res->id = task.id;
                             res->id_slot = id_slot;
@@ -2596,6 +2600,7 @@ private:
                             res->t_ms = (ggml_time_us() - t_start) / 1000.0;
                             res->checkpoint_bundle = true;
                             res->checkpoint_tokens = checkpoint->n_tokens;
+                            res->bundle_timings = timings;
                             queue_results.send(std::move(res));
                         } catch (const std::exception & err) {
                             send_error(task, std::string("Unable to save checkpoint bundle: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
@@ -2656,13 +2661,15 @@ private:
                     if (task.slot_action.checkpoint_bundle) {
                         bool native_restore_started = false;
                         try {
-                            auto bundle = server_checkpoint_bundle_read(filepath, checkpoint_bundle_identity(*slot));
+                            server_checkpoint_bundle_timings timings;
+                            auto bundle = server_checkpoint_bundle_read(filepath, checkpoint_bundle_identity(*slot, timings), &timings);
                             if (!bundle.tokens.validate(ctx_tgt)) {
                                 throw std::runtime_error("Invalid tokens in checkpoint bundle");
                             }
                             const auto packed_bytes = bundle.tokens.serialize();
                             llama_tokens packed(packed_bytes.size() / sizeof(llama_token));
                             std::memcpy(packed.data(), packed_bytes.data(), packed_bytes.size());
+                            const auto restore_start = ggml_time_us();
                             native_restore_started = true;
                             slot->prompt_clear();
                             // Check the partial state before it can enter the abort-on-failure checkpoint list.
@@ -2680,6 +2687,7 @@ private:
                             }
                             slot->prompt.tokens = std::move(bundle.tokens);
                             slot->prompt.checkpoints.push_back(std::move(bundle.checkpoint));
+                            timings.native_restore_ms = (ggml_time_us() - restore_start) / 1000.0;
                             auto res = std::make_unique<server_task_result_slot_save_load>();
                             res->id = task.id;
                             res->id_slot = id_slot;
@@ -2690,6 +2698,7 @@ private:
                             res->t_ms = (ggml_time_us() - t_start) / 1000.0;
                             res->checkpoint_bundle = true;
                             res->checkpoint_tokens = slot->prompt.checkpoints.front().n_tokens;
+                            res->bundle_timings = timings;
                             queue_results.send(std::move(res));
                         } catch (const std::exception & err) {
                             if (native_restore_started) {
