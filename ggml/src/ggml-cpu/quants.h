@@ -1,7 +1,7 @@
 #pragma once
 
 #define GGML_COMMON_DECL_C
-#include "ggml-common.h"
+#include "../ggml-common.h"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
