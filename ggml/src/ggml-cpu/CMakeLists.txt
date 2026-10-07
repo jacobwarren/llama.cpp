@@ -18,6 +18,9 @@ function(ggml_add_cpu_backend_features cpu_name arch)
 endfunction()
 
 function(ggml_add_cpu_backend_variant_impl tag_name)
+    if (GGML_PTQ_VNNI_INT8 AND NOT GGML_SYSTEM_ARCH STREQUAL "x86")
+        message(FATAL_ERROR "GGML_PTQ_VNNI_INT8 is an x86-only research option; leave it OFF for other targets")
+    endif()
     if (tag_name)
         set(GGML_CPU_NAME ggml-cpu-${tag_name})
     else()
@@ -377,6 +380,34 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
                     list(APPEND ARCH_DEFINITIONS GGML_AMX_BF16)
                 endif()
             endif()
+        endif()
+
+        if (GGML_PTQ_VNNI_INT8)
+            if (NOT CMAKE_C_COMPILER_ID STREQUAL "Clang" OR NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR NOT GGML_AVX2)
+                message(FATAL_ERROR "GGML_PTQ_VNNI_INT8 requires Clang C/C++ and explicit GGML_AVX2=ON")
+            endif()
+            include(CheckCXXSourceCompiles)
+            set(CMAKE_REQUIRED_FLAGS_SAVE ${CMAKE_REQUIRED_FLAGS})
+            string(REPLACE ";" " " ARCH_FLAGS_STR "${ARCH_FLAGS}")
+            set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} ${ARCH_FLAGS_STR}")
+            check_cxx_source_compiles("
+                #include <immintrin.h>
+                __attribute__((target(\"avx2,fma,f16c,avxvnniint8\"), noinline))
+                void dot(const char * a, const char * b, int * out) {
+                    __m256i x = _mm256_loadu_si256((const __m256i *) a);
+                    __m256i y = _mm256_loadu_si256((const __m256i *) b);
+                    _mm256_storeu_si256((__m256i *) out, _mm256_dpbssd_epi32(_mm256_setzero_si256(), x, y));
+                }
+                __attribute__((target(\"xsave\"), noinline))
+                unsigned long long state() { return _xgetbv(0); }
+                int main() { return 0; }
+                " GGML_COMPILER_SUPPORTS_PTQ_VNNI_INT8)
+            set(CMAKE_REQUIRED_FLAGS ${CMAKE_REQUIRED_FLAGS_SAVE})
+            if (NOT GGML_COMPILER_SUPPORTS_PTQ_VNNI_INT8)
+                message(FATAL_ERROR "Clang lacks isolated AVX-VNNI-INT8 intrinsics/target support")
+            endif()
+            list(APPEND GGML_CPU_SOURCES ggml-cpu/arch/x86/ptq-vnni-int8.cpp)
+            list(APPEND ARCH_DEFINITIONS GGML_USE_PTQ_VNNI_INT8)
         endif()
 
         if (GGML_BACKEND_DL)

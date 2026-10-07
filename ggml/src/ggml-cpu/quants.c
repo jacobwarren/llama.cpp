@@ -22,6 +22,22 @@
 
 #define UNUSED GGML_UNUSED
 
+int ggml_cpu_ptq_vnni_int8_enabled(void) {
+#ifdef GGML_USE_PTQ_VNNI_INT8
+    return ggml_cpu_ptq_vnni_int8_available();
+#else
+    return 0;
+#endif
+}
+
+void ggml_vec_dot_ptq1_0_q8_0_vnni_int8(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+#ifdef GGML_USE_PTQ_VNNI_INT8
+    ggml_cpu_ptq_vnni_int8_dot()(n, s, bs, vx, bx, vy, by, nrc);
+#else
+    ggml_vec_dot_ptq1_0_q8_0(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
 void quantize_row_q1_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q1_0_ref(x, y, k);
 }

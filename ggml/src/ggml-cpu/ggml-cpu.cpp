@@ -3,6 +3,7 @@
 #include "ggml-cpu.h"
 #include "repack.h"
 #include "traits.h"
+#include "quants.h"
 #include "ggml-impl.h"
 #include "amx/amx.h"
 
@@ -551,6 +552,9 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
         }
         if (ggml_cpu_has_avx_vnni()) {
             features.push_back({ "AVX_VNNI", "1" });
+        }
+        if (ggml_cpu_ptq_vnni_int8_enabled()) {
+            features.push_back({ "PTQ_VNNI_INT8", "1" });
         }
         if (ggml_cpu_has_avx2()) {
             features.push_back({ "AVX2", "1" });

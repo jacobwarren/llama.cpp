@@ -3,6 +3,7 @@
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include "../ggml/src/ggml-quants.h"
+#include "../ggml/src/ggml-cpu/quants.h"
 
 #undef NDEBUG
 #include <assert.h>
@@ -309,13 +310,65 @@ static int test_vec_dot_ptq1_0(bool verbose) {
                 const float ref = weights[pos] * ggml_fp16_to_fp32(acts[pos / QK8_0].d) * activation;
                 float result = INFINITY;
                 cpu->vec_dot(QK_PTQ1_0, &result, 0, &weight, 0, acts, 0, 1);
-                const bool failed = result != ref;
+                float variant = INFINITY;
+                ggml_vec_dot_ptq1_0_q8_0_vnni_int8(QK_PTQ1_0, &variant, 0, &weight, 0, acts, 0, 1);
+                const bool failed = result != ref || variant != result;
                 num_failed += failed;
                 if (failed) {
-                    printf("ptq1_0 one-hot pattern=%d pos=%d activation=%d: FAILED (ref=%f got=%f)\n", pattern, pos, activation, ref, result);
+                    printf("ptq1_0 one-hot pattern=%d pos=%d activation=%d: FAILED (ref=%f got=%f variant=%f)\n", pattern, pos, activation, ref, result, variant);
                 }
             }
             acts[pos / QK8_0].qs[pos % QK8_0] = 0;
+        }
+    }
+
+    // Isolate each four-byte lane so its exact integer sum is visible before float reduction.
+    const int lane_values[5][4] = {
+        {-128, -128, -128, -128}, {127, 127, 127, 127},
+        {-128, 127, -128, 127}, {-128, -1, 0, 1}, {127, 1, 0, -1},
+    };
+    weight.d = ggml_fp32_to_fp16(1.0f);
+    for (int group = 0; group < 4; ++group) {
+        acts[group].d = ggml_fp32_to_fp16(1.0f);
+    }
+    for (int pattern = 0; pattern < 18; ++pattern) {
+        if (pattern < 2) {
+            for (int i = 0; i < QK_PTQ1_0; ++i) {
+                weights[i] = pattern == 0 ? -1.0f : 1.0f;
+            }
+            traits->from_float_ref(weights, &weight, QK_PTQ1_0);
+            weight.d = ggml_fp32_to_fp16(1.0f);
+        } else {
+            for (size_t i = 0; i < sizeof(weight.qs); ++i) {
+                weight.qs[i] = static_cast<uint8_t>(pattern * 83 + i * 17);
+            }
+            for (size_t i = 0; i < sizeof(weight.qh); ++i) {
+                weight.qh[i] = static_cast<uint8_t>(pattern * 47 + i * 37);
+            }
+        }
+        traits->to_float(&weight, weights, QK_PTQ1_0);
+        for (int group = 0; group < 4; ++group) {
+            for (int lane = 0; lane < 8; ++lane) {
+                for (const auto & values : lane_values) {
+                    int expected = 0;
+                    for (int i = 0; i < 4; ++i) {
+                        const int pos = lane * 4 + i;
+                        acts[group].qs[pos] = static_cast<int8_t>(values[i]);
+                        expected += static_cast<int>(weights[group * QK8_0 + pos]) * values[i];
+                    }
+                    float original = INFINITY, variant = INFINITY;
+                    cpu->vec_dot(QK_PTQ1_0, &original, 0, &weight, 0, acts, 0, 1);
+                    ggml_vec_dot_ptq1_0_q8_0_vnni_int8(QK_PTQ1_0, &variant, 0, &weight, 0, acts, 0, 1);
+                    const bool failed = expected < -512 || expected > 512 || original != expected || variant != original;
+                    num_failed += failed;
+                    if (failed) {
+                        printf("ptq1_0 integer lane pattern=%d group=%d lane=%d: FAILED (expected=%d original=%f variant=%f)\n", pattern, group, lane, expected, original, variant);
+                    }
+                    for (int i = 0; i < 4; ++i) {
+                        acts[group].qs[lane * 4 + i] = 0;
+                    }
+                }
+            }
         }
     }
 
@@ -351,18 +404,21 @@ static int test_vec_dot_ptq1_0(bool verbose) {
             }
             float result = INFINITY;
             cpu->vec_dot(n, &result, 0, ptq.data(), 0, q8.data(), 0, 1);
+            float variant = INFINITY;
+            ggml_vec_dot_ptq1_0_q8_0_vnni_int8(n, &variant, 0, ptq.data(), 0, q8.data(), 0, 1);
             // Scale the bound by absolute products so near-zero sums do not hide cancellation.
             const double error = fabs((double) result - ref);
             const double limit = 1.0e-5 * abs_sum + 1.0e-5;
-            const bool failed = !(error <= limit);
+            const bool failed = !(error <= limit) || variant != result;
             num_failed += failed;
             if (failed || verbose) {
-                printf("ptq1_0 mixed-scale n=%d pattern=%d: %s (ref=%.9g got=%.9g err=%.9g limit=%.9g)\n", n, pattern, RESULT_STR[failed], ref, result, error, limit);
+                printf("ptq1_0 mixed-scale n=%d pattern=%d: %s (ref=%.9g got=%.9g variant=%.9g err=%.9g limit=%.9g)\n", n, pattern, RESULT_STR[failed], ref, result, variant, error, limit);
             }
         }
     }
     if (num_failed || verbose) {
         printf("ptq1_0 trit positions and mixed scales: %s (%d failures)\n", RESULT_STR[num_failed != 0], num_failed);
+        printf("ptq1_0 signed-dot route active: %d\n", ggml_cpu_ptq_vnni_int8_enabled());
     }
     return num_failed;
 }

@@ -1205,6 +1205,7 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     const struct ggml_compute_params * params,
     struct ggml_tensor * dst,
     const enum ggml_type type,
+    const ggml_vec_dot_t vec_dot,
     const int64_t num_rows_per_vec_dot,
     const int64_t ir0_start,
     const int64_t ir0_end,
@@ -1220,7 +1221,6 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 
     const bool src1_cont = ggml_is_contiguous(src1);
 
-    ggml_vec_dot_t const vec_dot      = ggml_cpu_vec_dot(src0);
     enum ggml_type const vec_dot_type = ggml_cpu_vec_dot_type(src0);
 
     // broadcast factors
@@ -1437,6 +1437,13 @@ UseGgmlGemm1:;
 UseGgmlGemm2:;
 #endif
 
+    ggml_vec_dot_t vec_dot = ggml_cpu_vec_dot(src0);
+#ifdef GGML_USE_PTQ_VNNI_INT8
+    if (src0->type == GGML_TYPE_PTQ1_0 && !params->use_ref) {
+        vec_dot = ggml_cpu_ptq_vnni_int8_dot();
+    }
+#endif
+
     // This is the size of the first dimension of the result, so we can iterate that way. (see the ASSERT above, these are the same numbers)
     const int64_t nr0 = ne0;
 
@@ -1491,7 +1498,7 @@ UseGgmlGemm2:;
         if ((nr0 % 2 != 0) || (ne11 % 2 != 0) || ((ir0_end - ir0_start) % 2 != 0) || ((ir1_end - ir1_start) % 2 != 0)) {
             num_rows_per_vec_dot = 1;
         }
-        ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
+        ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, vec_dot, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
 
         if (nth >= nchunk0 * nchunk1) {
             break;
