@@ -25,6 +25,21 @@ struct server_checkpoint_bundle {
     size_t n_bytes = 0;
 };
 
+struct server_checkpoint_bundle_runtime_profile {
+    std::string architecture;
+    int32_t n_swa = 0;
+    int32_t n_ctx_slot = 0;
+    bool draft_context = false;
+    bool draft_model = false;
+    std::vector<common_speculative_type> active_speculative_types;
+    bool multimodal_context = false;
+    bool media_tokens = false;
+    size_t slot_lora_count = 0;
+    std::string split_count;
+};
+
+void server_checkpoint_bundle_check_profile(const common_params & params, const server_checkpoint_bundle_runtime_profile & runtime);
+
 std::string server_checkpoint_bundle_hash_file(const std::string & path, uint64_t max_bytes);
 
 // Uses the pinned dense qwen35 memory layout without reading tensor data.

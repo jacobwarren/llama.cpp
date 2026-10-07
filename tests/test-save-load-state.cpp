@@ -17,8 +17,82 @@
 #include <fstream>
 #include <stdexcept>
 
+static void test_checkpoint_bundle_profiles() {
+    common_params supported_params;
+    supported_params.n_gpu_layers = 0;
+    supported_params.cache_type_k = GGML_TYPE_Q8_0;
+    supported_params.cache_type_v = GGML_TYPE_Q8_0;
+    supported_params.ctx_shift = false;
+    supported_params.speculative.types = {COMMON_SPECULATIVE_TYPE_NONE};
+    supported_params.tensor_buft_overrides.resize(llama_max_tensor_buft_overrides(), {nullptr, nullptr});
+    server_checkpoint_bundle_runtime_profile supported_runtime;
+    supported_runtime.architecture = "qwen35";
+    supported_runtime.n_ctx_slot = 4096;
+    supported_runtime.active_speculative_types = {COMMON_SPECULATIVE_TYPE_NONE};
+    server_checkpoint_bundle_check_profile(supported_params, supported_runtime);
+    {
+        auto params = supported_params;
+        params.tensor_buft_overrides.clear();
+        params.speculative.types.clear();
+        auto runtime = supported_runtime;
+        runtime.active_speculative_types.clear();
+        server_checkpoint_bundle_check_profile(params, runtime);
+    }
+    const auto reject_profile = [](const common_params & params, const server_checkpoint_bundle_runtime_profile & runtime, const char * field) {
+        try {
+            server_checkpoint_bundle_check_profile(params, runtime);
+        } catch (const std::runtime_error & error) {
+            if (std::string(error.what()).find(field) != std::string::npos) {
+                return;
+            }
+            throw;
+        }
+        throw std::runtime_error(std::string("Accepted unsupported profile: ") + field);
+    };
+    {
+        auto params = supported_params;
+        params.tensor_buft_overrides[0].pattern = "unused-pattern";
+        reject_profile(params, supported_runtime, "tensor_buft_overrides.nonempty=1");
+        params = supported_params;
+        params.tensor_buft_overrides[0].buft = ggml_backend_cpu_buffer_type();
+        reject_profile(params, supported_runtime, "tensor_buft_overrides.nonempty=1");
+        params.tensor_buft_overrides[0].pattern = "unused-pattern";
+        reject_profile(params, supported_runtime, "tensor_buft_overrides.nonempty=1");
+        params = supported_params;
+        params.ctx_shift = true;
+        reject_profile(params, supported_runtime, "ctx_shift=1");
+        params = supported_params;
+        params.n_gpu_layers = -1;
+        reject_profile(params, supported_runtime, "n_gpu_layers=-1");
+        params = supported_params;
+        params.speculative.types = {COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE};
+        reject_profile(params, supported_runtime, "speculative.types.requested=draft-simple");
+        params = supported_params;
+        params.cache_type_v = GGML_TYPE_F16;
+        reject_profile(params, supported_runtime, "cache_type_v=1");
+        auto runtime = supported_runtime;
+        runtime.architecture = "qwen35moe";
+        reject_profile(supported_params, runtime, "general.architecture=qwen35moe");
+        runtime = supported_runtime;
+        runtime.draft_context = true;
+        reject_profile(supported_params, runtime, "draft_context=1");
+        runtime = supported_runtime;
+        runtime.active_speculative_types = {COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE};
+        reject_profile(supported_params, runtime, "speculative.types.active=draft-simple");
+        runtime = supported_runtime;
+        runtime.split_count = "2";
+        reject_profile(supported_params, runtime, "split.count=2");
+    }
+}
+
 static int test_checkpoint_bundle_envelope() {
     ggml_time_init();
+    try {
+        test_checkpoint_bundle_profiles();
+    } catch (const std::exception & error) {
+        LOG_ERR("Checkpoint bundle profile test failed: %s\n", error.what());
+        return 1;
+    }
     namespace fs = std::filesystem;
     const auto directory = fs::temp_directory_path() / ("llama-checkpoint-test-" + std::to_string(ggml_time_us()) + ".bundle");
     if (!fs::create_directory(directory)) {

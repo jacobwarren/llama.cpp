@@ -2335,18 +2335,11 @@ private:
         llama_model_meta_val_str(model_tgt, "general.architecture", arch, sizeof(arch));
         char split_count[32] = {};
         const int split_count_length = llama_model_meta_val_str(model_tgt, LLM_KV_SPLIT_COUNT, split_count, sizeof(split_count));
-        const bool has_spec_types = std::any_of(params_base.speculative.types.begin(), params_base.speculative.types.end(),
-                [](common_speculative_type type) { return type != COMMON_SPECULATIVE_TYPE_NONE; });
-        if (std::string(arch) != "qwen35" || params_base.n_gpu_layers != 0 || n_swa != 0 ||
-                params_base.cache_type_k != GGML_TYPE_Q8_0 || params_base.cache_type_v != GGML_TYPE_Q8_0 ||
-                ctx_dft || model_dft || has_spec_types || !common_speculative_get_types(spec.get()).empty() ||
-                mctx || slot.prompt.tokens.has_mtmd || !params_base.lora_adapters.empty() || !slot.lora.empty() ||
-                !params_base.control_vectors.empty() || !params_base.kv_overrides.empty() || !params_base.tensor_buft_overrides.empty() ||
-                !params_base.kv_mean_center_path.empty() || params_base.ctx_shift || params_base.grp_attn_n != 1 ||
-                params_base.embedding || slot.n_ctx > static_cast<int32_t>(SERVER_CHECKPOINT_BUNDLE_MAX_TOKENS) ||
-                (split_count_length > 0 && std::string(split_count) != "1")) {
-            throw std::runtime_error("Checkpoint bundles require one dense qwen35 CPU GGUF, q8_0 K/V, text only, no draft, adapters, SWA, overrides or context shifts");
-        }
+        server_checkpoint_bundle_check_profile(params_base, {
+            std::string(arch), n_swa, slot.n_ctx, ctx_dft != nullptr, model_dft != nullptr,
+            common_speculative_get_types(spec.get()), mctx != nullptr, slot.prompt.tokens.has_mtmd,
+            slot.lora.size(), split_count_length > 0 ? std::string(split_count) : std::string(),
+        });
         if (checkpoint_model_source.empty() || std::filesystem::file_size(checkpoint_model_source) != checkpoint_model_bytes ||
                 std::filesystem::last_write_time(checkpoint_model_source) != checkpoint_model_mtime) {
             throw std::runtime_error("Model source changed or is unavailable; restart before using checkpoint bundles");

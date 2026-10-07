@@ -1,6 +1,7 @@
 #include "server-checkpoint-bundle.h"
 #include "platform/checkpoint-bundle.h"
 #include "src/llama-model.h"
+#include "speculative.h"
 
 #include "hash/hash.h"
 extern "C" {
@@ -298,6 +299,55 @@ std::string server_checkpoint_bundle_hash_file(const std::string & path, uint64_
     unsigned char digest[SHA256_DIGEST_SIZE];
     sha256_final(&state, digest);
     return digest_hex(digest);
+}
+
+void server_checkpoint_bundle_check_profile(const common_params & params, const server_checkpoint_bundle_runtime_profile & runtime) {
+    const auto check = [](bool supported, const char * field, const std::string & value) {
+        if (!supported) {
+            throw std::runtime_error(std::string("Checkpoint bundle unsupported ") + field + "=" + value);
+        }
+    };
+    const auto speculative_types = [](const std::vector<common_speculative_type> & types) {
+        std::string result;
+        for (const auto type : types) {
+            if (type != COMMON_SPECULATIVE_TYPE_NONE) {
+                if (!result.empty()) {
+                    result += ",";
+                }
+                result += common_speculative_type_to_str(type);
+            }
+        }
+        return result;
+    };
+    const auto requested_speculation = speculative_types(params.speculative.types);
+    const auto active_speculation = speculative_types(runtime.active_speculative_types);
+    size_t tensor_overrides = 0;
+    for (const auto & override : params.tensor_buft_overrides) {
+        // Argument parsing pads this vector with null terminators for fitting.
+        tensor_overrides += override.pattern != nullptr || override.buft != nullptr;
+    }
+    check(runtime.architecture == "qwen35", "general.architecture", runtime.architecture);
+    check(params.n_gpu_layers == 0, "n_gpu_layers", std::to_string(params.n_gpu_layers));
+    check(runtime.n_swa == 0, "n_swa", std::to_string(runtime.n_swa));
+    check(params.cache_type_k == GGML_TYPE_Q8_0, "cache_type_k", std::to_string(static_cast<int32_t>(params.cache_type_k)));
+    check(params.cache_type_v == GGML_TYPE_Q8_0, "cache_type_v", std::to_string(static_cast<int32_t>(params.cache_type_v)));
+    check(!runtime.draft_context, "draft_context", std::to_string(runtime.draft_context));
+    check(!runtime.draft_model, "draft_model", std::to_string(runtime.draft_model));
+    check(requested_speculation.empty(), "speculative.types.requested", requested_speculation);
+    check(active_speculation.empty(), "speculative.types.active", active_speculation);
+    check(!runtime.multimodal_context, "multimodal_context", std::to_string(runtime.multimodal_context));
+    check(!runtime.media_tokens, "media_tokens", std::to_string(runtime.media_tokens));
+    check(params.lora_adapters.empty(), "lora_adapters.count", std::to_string(params.lora_adapters.size()));
+    check(runtime.slot_lora_count == 0, "slot_lora.count", std::to_string(runtime.slot_lora_count));
+    check(params.control_vectors.empty(), "control_vectors.count", std::to_string(params.control_vectors.size()));
+    check(params.kv_overrides.empty(), "kv_overrides.count", std::to_string(params.kv_overrides.size()));
+    check(tensor_overrides == 0, "tensor_buft_overrides.nonempty", std::to_string(tensor_overrides));
+    check(params.kv_mean_center_path.empty(), "kv_mean_center.enabled", std::to_string(!params.kv_mean_center_path.empty()));
+    check(!params.ctx_shift, "ctx_shift", std::to_string(params.ctx_shift));
+    check(params.grp_attn_n == 1, "grp_attn_n", std::to_string(params.grp_attn_n));
+    check(!params.embedding, "embedding", std::to_string(params.embedding));
+    check(runtime.n_ctx_slot > 0 && runtime.n_ctx_slot <= static_cast<int32_t>(SERVER_CHECKPOINT_BUNDLE_MAX_TOKENS), "n_ctx_slot", std::to_string(runtime.n_ctx_slot));
+    check(runtime.split_count.empty() || runtime.split_count == "1", "split.count", runtime.split_count);
 }
 
 json server_checkpoint_bundle_native_layout(

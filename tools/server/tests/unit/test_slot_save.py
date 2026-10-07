@@ -143,7 +143,7 @@ def test_checkpoint_bundle_unsupported_model_preserves_idle_prompt():
             "filename": "unsupported.bundle", "checkpoint_bundle": True,
         })
         assert res.status_code == 400
-        assert "Checkpoint bundles require" in res.body["error"]["message"]
+        assert "Checkpoint bundle unsupported general.architecture=" in res.body["error"]["message"]
 
     res = server.make_request("POST", "/completion", data=data)
     assert res.status_code == 200
