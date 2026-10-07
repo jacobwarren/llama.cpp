@@ -16,7 +16,9 @@
 #include "log.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -7203,6 +7205,51 @@ static void test_responses_reasoning_content_index() {
     assert_equals(std::string("response.content_part.added"), text.at(1).at("event").get<std::string>());
     assert_equals(json({{"type", "response.output_text.delta"}, {"item_id", "msg_fixture"}, {"delta", "fixture-output"}}).dump(), text.at(2).at("data").dump());
     assert_equals(false, text_only.thinking_block_started);
+
+    if (const char * capture_dir = std::getenv("LLAMA_TEST_RESPONSES_CAPTURE_DIR")) {
+        const auto dir = std::filesystem::u8path(capture_dir);
+        assert_equals(true, dir.is_absolute() && std::filesystem::is_directory(dir));
+        assert_equals(false, std::filesystem::is_symlink(std::filesystem::symlink_status(dir)));
+        const auto reasoning_path = dir / "reasoning.sse";
+        const auto text_path = dir / "text-only.sse";
+        assert_equals(false, std::filesystem::exists(std::filesystem::symlink_status(reasoning_path)) ||
+                             std::filesystem::exists(std::filesystem::symlink_status(text_path)));
+
+        server_task_result_cmpl_partial created{};
+        created.oai_resp_id = "resp_fixture";
+        const json start = created.to_json_oaicompat_resp();
+
+        final.oai_resp_id                 = created.oai_resp_id;
+        final.oai_resp_message_id         = text_only.oai_resp_message_id;
+        final.oaicompat_model             = "bonsai-2-27b";
+        final.oaicompat_msg.content       = diff.content_delta;
+        final.n_prompt_tokens            = 1;
+        final.n_decoded                  = 1;
+        const json reasoning_done = final.to_json_oaicompat_resp_stream();
+        final.oaicompat_msg.reasoning_content = "";
+        const json text_done = final.to_json_oaicompat_resp_stream();
+
+        const auto write_sse = [](const std::filesystem::path & path, std::initializer_list<json> chunks) {
+            std::ofstream output(path, std::ios::binary);
+            if (!output) {
+                throw std::runtime_error("Cannot open Responses fixture capture");
+            }
+            for (const json & chunk : chunks) {
+                for (const json & event : chunk) {
+                    output << "event: " << event.at("event").get<std::string>() << "\ndata: " << event.at("data").dump() << "\n\n";
+                }
+            }
+            if (!output) {
+                throw std::runtime_error("Cannot write Responses fixture capture");
+            }
+            output.close();
+            if (!output) {
+                throw std::runtime_error("Cannot close Responses fixture capture");
+            }
+        };
+        write_sse(reasoning_path, { start, first, next, text, reasoning_done });
+        write_sse(text_path, { start, text, text_done });
+    }
 }
 
 int main(int argc, char ** argv) {
