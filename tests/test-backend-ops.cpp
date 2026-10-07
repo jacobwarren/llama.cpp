@@ -19,6 +19,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
+#include "../ggml/src/ggml-quants.h"
 
 #include <algorithm>
 #include <atomic>
@@ -4634,6 +4635,48 @@ struct test_mul_mat : public test_case {
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return ggml_op_name(GGML_OP_MUL_MAT);
+    }
+};
+
+struct test_ptq_activation_tile : public test_mul_mat {
+    const int pattern;
+
+    test_ptq_activation_tile(int64_t m, int64_t n, int64_t k, int pattern)
+        : test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_Q8_0, m, n, k, {1, 1}, {1, 1}), pattern(pattern) {}
+
+    std::string vars() override {
+        return test_mul_mat::vars() + ",signed_bytes=1,pattern=" + std::to_string(pattern);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_mul_mat::initialize_tensors(ctx);
+        for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
+            if (tensor->type == GGML_TYPE_PTQ1_0) {
+                GGML_ASSERT(ggml_is_contiguous(tensor));
+                std::vector<block_ptq1_0> blocks(ggml_nelements(tensor) / QK_PTQ1_0);
+                for (size_t i = 0; i < blocks.size(); ++i) {
+                    blocks[i].d = ggml_fp32_to_fp16(0.0153f + 0.0307f * static_cast<float>(i % 11));
+                    for (size_t j = 0; j < sizeof(blocks[i].qs); ++j) {
+                        blocks[i].qs[j] = static_cast<uint8_t>(pattern * 83 + i * 31 + j * 17);
+                    }
+                    for (size_t j = 0; j < sizeof(blocks[i].qh); ++j) {
+                        blocks[i].qh[j] = static_cast<uint8_t>(pattern * 47 + i * 23 + j * 37);
+                    }
+                }
+                ggml_backend_tensor_set(tensor, blocks.data(), 0, blocks.size() * sizeof(blocks[0]));
+            } else if (tensor->type == GGML_TYPE_Q8_0) {
+                GGML_ASSERT(ggml_is_contiguous(tensor));
+                std::vector<block_q8_0> blocks(ggml_nelements(tensor) / QK8_0);
+                for (size_t i = 0; i < blocks.size(); ++i) {
+                    blocks[i].d = ggml_fp32_to_fp16(0.003f + 0.017f * static_cast<float>(i % 7));
+                    for (int j = 0; j < QK8_0; ++j) {
+                        const int value = pattern == 0 ? -128 : pattern == 1 ? 127 : static_cast<int>((i * 13 + j * 37) % 256) - 128;
+                        blocks[i].qs[j] = static_cast<int8_t>(value);
+                    }
+                }
+                ggml_backend_tensor_set(tensor, blocks.data(), 0, blocks.size() * sizeof(blocks[0]));
+            }
+        }
     }
 };
 
@@ -9551,15 +9594,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // PTQ GEMM tiles and both tails, including a final token after several two-token tiles.
+    // PTQ GEMM row/token tails for two- and four-column tiles.
     for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) {
-        for (int m : {1, 2, 3}) {
-            for (int n : {2, 3, 4, 5, 7, 8, 9}) {
+        for (int m : {1, 2, 3, 5}) {
+            for (int n : {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 15, 16, 17}) {
                 test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, type_b, m, n, 128, {1, 1}, {1, 1}));
             }
         }
         for (int k : {5120, 6144, 10240, 17408}) {
-            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, type_b, 3, 9, k, {1, 1}, {1, 1}));
+            for (int n : {4, 5, 6, 7, 8, 9, 16, 17}) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, type_b, 3, n, k, {1, 1}, {1, 1}));
+            }
         }
     }
     for (int n : {2, 4, 9}) {
@@ -9567,6 +9612,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_Q8_0, 3, 9, 5120, {2, 1}, {1, 2}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 3, 3, 128, {2, 3}, {1, 1}, {0, 2, 1, 3}));
+    for (int n : {4, 5, 6, 7, 16, 17}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 5, n, 5120, {2, 3}, {2, 1}, {0, 1, 2, 3}, 5248));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_Q8_0, 5, n, 5120, {2, 1}, {1, 2}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 5, n, 128, {2, 3}, {1, 1}, {0, 2, 1, 3}));
+    }
+    for (int pattern : {0, 1, 2}) {
+        for (int n : {4, 5, 6, 7, 16, 17}) {
+            test_cases.emplace_back(new test_ptq_activation_tile(3, n, 128, pattern));
+        }
+        for (int k : {5120, 6144, 10240, 17408}) {
+            test_cases.emplace_back(new test_ptq_activation_tile(3, 17, k, pattern));
+        }
+    }
 
     // BF16 is absent from base_types: add the 3 standard non-contig permutations explicitly
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 16,  1, 256, {2, 3}, {1, 1}, {0, 2, 1, 3}));
