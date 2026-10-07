@@ -77,11 +77,11 @@ static int test_checkpoint_bundle_envelope() {
 
     const json shape = {
         {"n_stream", 1}, {"pos_per_embd", 4}, {"v_trans", false},
-        {"attention_keys", {{{"type", GGML_TYPE_Q8_0}, {"row_bytes", 34}}}},
-        {"attention_values", {{{"type", GGML_TYPE_Q8_0}, {"row_bytes", 34}}}},
+        {"attention_keys", json::array({json{{"type", GGML_TYPE_Q8_0}, {"row_bytes", 34}}})},
+        {"attention_values", json::array({json{{"type", GGML_TYPE_Q8_0}, {"row_bytes", 34}}})},
         {"recurrent_layers", 2},
-        {"recurrent_r", {{{"type", GGML_TYPE_F32}, {"row_bytes", 4}}}},
-        {"recurrent_s", {{{"type", GGML_TYPE_F32}, {"row_bytes", 4}}}},
+        {"recurrent_r", json::array({json{{"type", GGML_TYPE_F32}, {"row_bytes", 4}}})},
+        {"recurrent_s", json::array({json{{"type", GGML_TYPE_F32}, {"row_bytes", 4}}})},
     };
     const json identity = {
         {"model_sha256", std::string(64, 'a')}, {"engine", {{"commit", "test"}}},
@@ -107,7 +107,7 @@ static int test_checkpoint_bundle_envelope() {
     const auto reset = [&]() {
         manifest = {
             {"format", "rig-checkpoint-bundle"}, {"version", 1}, {"identity", identity},
-            {"source_slot", 0}, {"token_ids", {1, 2, 3, 4}},
+            {"source_slot", 0}, {"token_ids", json::array({1, 2, 3, 4})},
             {"checkpoint", {{"n_tokens", 2}, {"pos_min", 1}, {"pos_max", 1}, {"flags", LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY}}},
         };
         refresh_payload("endpoint.ggsq", endpoint, manifest["endpoint"]);
