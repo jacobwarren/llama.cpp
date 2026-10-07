@@ -490,6 +490,8 @@ typedef pthread_mutex_t    ggml_mutex_t;
 #endif
 
 // Threadpool def
+struct ggml_cpu_profile;
+
 struct ggml_threadpool {
     ggml_mutex_t mutex;       // mutex for cond.var
     ggml_cond_t  cond;        // cond.var for waiting for new work
@@ -514,7 +516,136 @@ struct ggml_threadpool {
     uint32_t     poll;        // Polling level (0 - no polling)
 
     enum ggml_status ec;
+
+    // Only worker 0 accesses this graph-local state.
+    struct ggml_cpu_profile * profile;
 };
+
+#define GGML_CPU_PROFILE_MAX_NODES 4096
+
+enum ggml_cpu_profile_route {
+    GGML_CPU_PROFILE_DEFAULT,
+    GGML_CPU_PROFILE_EMPTY,
+    GGML_CPU_PROFILE_EXTRA,
+    GGML_CPU_PROFILE_FWHT,
+    GGML_CPU_PROFILE_LLAMAFILE_NATIVE,
+    GGML_CPU_PROFILE_LLAMAFILE_CONVERTED,
+    GGML_CPU_PROFILE_PTQ_COMPACT_NATIVE,
+    GGML_CPU_PROFILE_PTQ_COMPACT_CONVERTED,
+    GGML_CPU_PROFILE_VEC_DOT,
+    GGML_CPU_PROFILE_PTQ_VEC_DOT_GEMV,
+    GGML_CPU_PROFILE_PTQ_VEC_DOT_BATCH,
+    GGML_CPU_PROFILE_VEC_DOT_ID,
+};
+
+struct ggml_cpu_profile_node {
+    const struct ggml_tensor * node;
+    int index;
+    int fused_nodes;
+    enum ggml_cpu_profile_route route;
+    bool q8_conversion;
+    int64_t compute_inclusive_us;
+    int64_t control_us;
+    int64_t boundary_wait_us;
+    int64_t q8_thread0_us;
+    int64_t q8_shared_wait_us;
+};
+
+struct ggml_cpu_profile {
+    struct ggml_cpu_profile_node * nodes;
+    struct ggml_cpu_profile_node * current;
+    int capacity;
+    int count;
+    int dropped;
+    bool allocation_failed;
+    uint32_t graph_id;
+    int64_t final_wait_us;
+    int64_t wall_start_us;
+};
+
+static atomic_int ggml_cpu_profile_graph_id = 0;
+
+static struct ggml_cpu_profile_node * ggml_cpu_profile_current(const struct ggml_compute_params * params,
+                                                             const struct ggml_tensor * node) {
+    if (params->ith != 0 || params->threadpool->profile == NULL) {
+        return NULL;
+    }
+    struct ggml_cpu_profile_node * row = params->threadpool->profile->current;
+    return row && row->node == node ? row : NULL;
+}
+
+static const char * ggml_cpu_profile_route_name(enum ggml_cpu_profile_route route) {
+    switch (route) {
+        case GGML_CPU_PROFILE_DEFAULT:               return "default";
+        case GGML_CPU_PROFILE_EMPTY:                 return "empty";
+        case GGML_CPU_PROFILE_EXTRA:                 return "extra_buffer";
+        case GGML_CPU_PROFILE_FWHT:                  return "fwht";
+        case GGML_CPU_PROFILE_LLAMAFILE_NATIVE:      return "llamafile_native";
+        case GGML_CPU_PROFILE_LLAMAFILE_CONVERTED:   return "llamafile_converted";
+        case GGML_CPU_PROFILE_PTQ_COMPACT_NATIVE:    return "ptq_compact_native";
+        case GGML_CPU_PROFILE_PTQ_COMPACT_CONVERTED: return "ptq_compact_converted";
+        case GGML_CPU_PROFILE_VEC_DOT:               return "vec_dot";
+        case GGML_CPU_PROFILE_PTQ_VEC_DOT_GEMV:      return "ptq_vec_dot_gemv";
+        case GGML_CPU_PROFILE_PTQ_VEC_DOT_BATCH:     return "ptq_vec_dot_batch";
+        case GGML_CPU_PROFILE_VEC_DOT_ID:            return "vec_dot_id";
+    }
+    GGML_ABORT("invalid CPU profile route");
+}
+
+static const char * ggml_cpu_profile_category(const struct ggml_cpu_profile_node * row) {
+    if (row->route == GGML_CPU_PROFILE_FWHT) {
+        return "fwht";
+    }
+    switch (row->node->op) {
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_ID:
+            return row->node->src[0]->type == GGML_TYPE_PTQ1_0 ? "ptq" : "matmul";
+        case GGML_OP_GATED_DELTA_NET:
+            return "gdn";
+        case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_FLASH_ATTN_BACK:
+        case GGML_OP_SOFT_MAX:
+        case GGML_OP_SOFT_MAX_BACK:
+            return "attention";
+        default:
+            return "other";
+    }
+}
+
+static void ggml_cpu_profile_emit(const struct ggml_cpu_profile * profile, const struct ggml_cgraph * graph,
+                                 int n_threads, enum ggml_status status, int64_t wall_us) {
+    int64_t compute_us = 0;
+    int64_t control_us = 0;
+    int64_t boundary_us = 0;
+    for (int i = 0; i < profile->count; ++i) {
+        const struct ggml_cpu_profile_node * row = &profile->nodes[i];
+        const struct ggml_tensor * node = row->node;
+        const bool matmul = node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID;
+        const int32_t hint = node->op == GGML_OP_MUL_MAT ? ggml_get_op_params_i32(node, 1) : 0;
+        compute_us += row->compute_inclusive_us;
+        control_us += row->control_us;
+        boundary_us += row->boundary_wait_us;
+        GGML_LOG_INFO("ggml_cpu_profile node v=1 graph=%" PRIu32 " index=%d fused_nodes=%d op=%s category=%s route=%s hint=%" PRId32
+                      " weight_type=%s src1_type=%s K=%" PRId64 " M=%" PRId64 " N=%" PRId64 " planes=%" PRId64
+                      " ne0=%" PRId64 " ne1=%" PRId64 " ne2=%" PRId64 " ne3=%" PRId64
+                      " compute_inclusive_us=%" PRId64 " control_us=%" PRId64 " boundary_wait_us=%" PRId64
+                      " q8_conversion=%d q8_thread0_us=%" PRId64 " q8_shared_wait_us=%" PRId64 "\n",
+                      profile->graph_id, row->index, row->fused_nodes, ggml_op_name(node->op),
+                      ggml_cpu_profile_category(row), ggml_cpu_profile_route_name(row->route), hint,
+                      node->src[0] ? ggml_type_name(node->src[0]->type) : "none",
+                      node->src[1] ? ggml_type_name(node->src[1]->type) : "none",
+                      matmul ? node->src[0]->ne[0] : 0, matmul ? node->src[0]->ne[1] : 0,
+                      matmul ? node->src[1]->ne[1] : 0, matmul ? node->ne[2]*node->ne[3] : 0,
+                      node->ne[0], node->ne[1], node->ne[2], node->ne[3],
+                      row->compute_inclusive_us, row->control_us, row->boundary_wait_us,
+                      row->q8_conversion, row->q8_thread0_us, row->q8_shared_wait_us);
+    }
+    GGML_LOG_INFO("ggml_cpu_profile graph v=1 graph=%" PRIu32 " nodes=%d recorded=%d dropped=%d allocation_failed=%d threads=%d status=%d"
+                  " wall_us=%" PRId64 " recorded_compute_inclusive_us=%" PRId64 " recorded_control_us=%" PRId64
+                  " recorded_boundary_wait_us=%" PRId64 " final_wait_us=%" PRId64 "\n",
+                  profile->graph_id, graph->n_nodes, profile->count, profile->dropped, profile->allocation_failed, n_threads, status,
+                  wall_us, compute_us, control_us, boundary_us, profile->final_wait_us);
+}
 
 // Per-thread state
 struct ggml_compute_state {
@@ -1299,9 +1430,13 @@ void ggml_compute_forward_mul_mat(
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
+    struct ggml_cpu_profile_node * profile = ggml_cpu_profile_current(params, dst);
 
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && !params->use_ref) {
+        if (profile) {
+            profile->route = GGML_CPU_PROFILE_FWHT;
+        }
         ggml_compute_forward_fwht(params, dst);
         return;
     }
@@ -1356,11 +1491,16 @@ void ggml_compute_forward_mul_mat(
                                      src1->type,
                                      dst->type))
                     goto UseGgmlGemm1;
+        if (profile) {
+            profile->route = src0->type == GGML_TYPE_PTQ1_0 ? GGML_CPU_PROFILE_PTQ_COMPACT_NATIVE : GGML_CPU_PROFILE_LLAMAFILE_NATIVE;
+        }
         return;
     }
 UseGgmlGemm1:;
 #endif
 
+    const bool profile_q8 = profile && src1->type != vec_dot_type && vec_dot_type == GGML_TYPE_Q8_0;
+    const int64_t q8_start_us = profile_q8 ? ggml_time_us() : 0;
     if (src1->type != vec_dot_type) {
         char * wdata = params->wdata;
 
@@ -1405,13 +1545,21 @@ UseGgmlGemm1:;
         }
     #endif
     }
+    const int64_t q8_end_us = profile_q8 ? ggml_time_us() : 0;
 
     if (ith == 0) {
         // Every thread starts at ith, so the first unprocessed chunk is nth.  This save a bit of coordination right at the start.
         atomic_store_explicit(&params->threadpool->current_chunk, nth, memory_order_relaxed);
     }
 
+    const int64_t q8_wait_start_us = profile_q8 ? ggml_time_us() : 0;
     ggml_barrier(params->threadpool);
+    if (profile_q8) {
+        const int64_t q8_wait_end_us = ggml_time_us();
+        profile->q8_conversion = true;
+        profile->q8_thread0_us = q8_end_us - q8_start_us;
+        profile->q8_shared_wait_us = q8_wait_end_us - q8_wait_start_us;
+    }
 
 #if GGML_USE_LLAMAFILE
     if (src1->type != vec_dot_type) {
@@ -1432,10 +1580,18 @@ UseGgmlGemm1:;
                                      vec_dot_type,
                                      dst->type))
                     goto UseGgmlGemm2;
+        if (profile) {
+            profile->route = src0->type == GGML_TYPE_PTQ1_0 ? GGML_CPU_PROFILE_PTQ_COMPACT_CONVERTED : GGML_CPU_PROFILE_LLAMAFILE_CONVERTED;
+        }
         return;
     }
 UseGgmlGemm2:;
 #endif
+
+    if (profile) {
+        profile->route = src0->type != GGML_TYPE_PTQ1_0 ? GGML_CPU_PROFILE_VEC_DOT :
+                        ne11 == 1 ? GGML_CPU_PROFILE_PTQ_VEC_DOT_GEMV : GGML_CPU_PROFILE_PTQ_VEC_DOT_BATCH;
+    }
 
     // This is the size of the first dimension of the result, so we can iterate that way. (see the ASSERT above, these are the same numbers)
     const int64_t nr0 = ne0;
@@ -1586,6 +1742,10 @@ static void ggml_compute_forward_mul_mat_id(
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
     const struct ggml_tensor * ids = dst->src[2];
+    struct ggml_cpu_profile_node * profile = ggml_cpu_profile_current(params, dst);
+    if (profile) {
+        profile->route = GGML_CPU_PROFILE_VEC_DOT_ID;
+    }
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -1630,6 +1790,8 @@ static void ggml_compute_forward_mul_mat_id(
 
     GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
 
+    const bool profile_q8 = profile && src1->type != vec_dot_type && vec_dot_type == GGML_TYPE_Q8_0;
+    const int64_t q8_start_us = profile_q8 ? ggml_time_us() : 0;
     if (src1->type != vec_dot_type) {
         char * wdata = params->wdata;
 
@@ -1666,6 +1828,7 @@ static void ggml_compute_forward_mul_mat_id(
         }
 #endif
     }
+    const int64_t q8_end_us = profile_q8 ? ggml_time_us() : 0;
 
     if (ith == 0) {
         // initialize matrix_row_counts
@@ -1690,7 +1853,14 @@ static void ggml_compute_forward_mul_mat_id(
         *current_chunk_ctr = nth;
     }
 
+    const int64_t q8_wait_start_us = profile_q8 ? ggml_time_us() : 0;
     ggml_barrier(params->threadpool);
+    if (profile_q8) {
+        const int64_t q8_wait_end_us = ggml_time_us();
+        profile->q8_conversion = true;
+        profile->q8_thread0_us = q8_end_us - q8_start_us;
+        profile->q8_shared_wait_us = q8_wait_end_us - q8_wait_start_us;
+    }
 
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
@@ -1760,11 +1930,19 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     GGML_ASSERT(params);
 
     if (tensor->op == GGML_OP_NONE || ggml_is_empty(tensor)) {
+        struct ggml_cpu_profile_node * profile = ggml_cpu_profile_current(params, tensor);
+        if (profile) {
+            profile->route = GGML_CPU_PROFILE_EMPTY;
+        }
         return;
     }
 
     // extra_buffer op?
     if (ggml_cpu_extra_compute_forward(params, tensor)) {
+        struct ggml_cpu_profile_node * profile = ggml_cpu_profile_current(params, tensor);
+        if (profile) {
+            profile->route = GGML_CPU_PROFILE_EXTRA;
+        }
         return;
     }
 
@@ -3138,6 +3316,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
+    struct ggml_cpu_profile * profile = state->ith == 0 ? tp->profile : NULL;
+
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
@@ -3150,6 +3330,19 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
+        struct ggml_cpu_profile_node * row = NULL;
+        if (profile) {
+            if (profile->count < profile->capacity) {
+                row = &profile->nodes[profile->count++];
+                row->node = node;
+                row->index = node_n;
+            } else {
+                profile->dropped++;
+            }
+            profile->current = row;
+        }
+        const int64_t compute_start_us = row ? ggml_time_us() : 0;
+
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
@@ -3158,15 +3351,27 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         } else {
             ggml_compute_forward(&params, node);
         }
+        const int64_t compute_end_us = row ? ggml_time_us() : 0;
+        if (row) {
+            row->fused_nodes = n_fused + 1;
+            row->compute_inclusive_us = compute_end_us - compute_start_us;
+        }
 
         if (state->ith == 0 && cplan->abort_callback &&
                 cplan->abort_callback(cplan->abort_callback_data)) {
             atomic_store_explicit(&tp->abort, node_n + 1, memory_order_relaxed);
             tp->ec    = GGML_STATUS_ABORTED;
         }
+        const int64_t control_end_us = row ? ggml_time_us() : 0;
+        if (row) {
+            row->control_us = control_end_us - compute_end_us;
+        }
 
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
+            if (row) {
+                row->boundary_wait_us = ggml_time_us() - control_end_us;
+            }
         }
     }
 
@@ -3176,7 +3381,12 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-done cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
+    const int64_t final_wait_start_us = profile ? ggml_time_us() : 0;
     ggml_barrier(state->threadpool);
+    if (profile) {
+        profile->final_wait_us = ggml_time_us() - final_wait_start_us;
+        profile->current = NULL;
+    }
 
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
     ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(state->ith);
@@ -3345,6 +3555,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->poll             = tpp->poll;
         threadpool->prio             = tpp->prio;
         threadpool->ec               = GGML_STATUS_SUCCESS;
+        threadpool->profile          = NULL;
     }
 
     // Allocate and init workers state
@@ -3428,6 +3639,25 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
 
+    struct ggml_cpu_profile profile = { 0 };
+    const char * profile_env = getenv("GGML_CPU_PROFILE");
+    const bool profile_enabled = profile_env != NULL && strcmp(profile_env, "1") == 0;
+    if (profile_enabled) {
+        profile.graph_id = (uint32_t) atomic_fetch_add_explicit(&ggml_cpu_profile_graph_id, 1, memory_order_relaxed) + UINT32_C(1);
+        profile.capacity = MIN(cgraph->n_nodes, GGML_CPU_PROFILE_MAX_NODES);
+        if (profile.capacity > 0) {
+            profile.nodes = calloc((size_t) profile.capacity, sizeof(*profile.nodes));
+            if (profile.nodes == NULL) {
+                profile.capacity = 0;
+                profile.allocation_failed = true;
+            }
+        }
+        threadpool->profile = &profile;
+        profile.wall_start_us = ggml_time_us();
+    } else {
+        threadpool->profile = NULL;
+    }
+
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
         #pragma omp parallel num_threads(n_threads)
@@ -3465,10 +3695,18 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     ggml_graph_compute_thread(&threadpool->workers[0]);
 #endif
 
+    const int64_t profile_wall_us = profile_enabled ? ggml_time_us() - profile.wall_start_us : 0;
+    threadpool->profile = NULL;
+
     // don't leave affinity set on the main thread
     clear_numa_thread_affinity();
 
     enum ggml_status ret = threadpool->ec;
+
+    if (profile_enabled) {
+        ggml_cpu_profile_emit(&profile, cgraph, n_threads, ret, profile_wall_us);
+        free(profile.nodes);
+    }
 
     if (disposable_threadpool) {
         ggml_threadpool_free(threadpool);
