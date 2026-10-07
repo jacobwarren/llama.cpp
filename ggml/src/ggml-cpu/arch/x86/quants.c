@@ -7,6 +7,7 @@
 
 #include "../../quants.h"
 #include "../../ggml-cpu-impl.h"
+#include "ptq1_0.h"
 
 #include <math.h>
 #include <string.h>
@@ -598,34 +599,6 @@ static inline __m128i decode_trits_ssse3(__m128i * x) {
 }
 #endif
 
-#if defined(__AVX2__)
-// Multiply each byte modulo 256. Both bytes of a word use the same power of 3.
-static inline __m256i ptq1_0_mul_u8(__m256i x, __m256i c) {
-    const __m256i lo = _mm256_and_si256(_mm256_mullo_epi16(x, c), _mm256_set1_epi16(0x00FF));
-    const __m256i hi = _mm256_mullo_epi16(_mm256_and_si256(x, _mm256_set1_epi16((short) 0xFF00)), c);
-    return _mm256_or_si256(lo, hi);
-}
-
-// floor(3*v/256) is (v >= 86) + (v >= 171).
-static inline __m256i ptq1_0_trit(__m256i v) {
-    const __m256i biased = _mm256_xor_si256(v, _mm256_set1_epi8(-128));
-    const __m256i ge1 = _mm256_cmpgt_epi8(biased, _mm256_set1_epi8(85 - 128));
-    const __m256i ge2 = _mm256_cmpgt_epi8(biased, _mm256_set1_epi8(170 - 128));
-    return _mm256_sub_epi8(_mm256_setzero_si256(), _mm256_add_epi8(ge1, ge2));
-}
-
-// Keep unsigned codes until after the dot to handle -128 activations.
-static inline __m256i ptq1_0_dot(__m256i codes, __m256i y) {
-#if defined(GGML_DPBUSD_256)
-    return _mm256_sub_epi32(GGML_DPBUSD_256(_mm256_setzero_si256(), codes, y),
-                            GGML_DPBUSD_256(_mm256_setzero_si256(), _mm256_set1_epi8(1), y));
-#else
-    const __m256i s16 = _mm256_sub_epi16(_mm256_maddubs_epi16(codes, y), _mm256_maddubs_epi16(_mm256_set1_epi8(1), y));
-    return _mm256_madd_epi16(s16, _mm256_set1_epi16(1));
-#endif
-}
-#endif
-
 void ggml_vec_dot_pq2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK_PQ2_0;
     const int nb = n / qk;
@@ -754,31 +727,16 @@ void ggml_vec_dot_ptq1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
     const block_ptq1_0 * GGML_RESTRICT x = vx;
     const block_q8_0 * GGML_RESTRICT y = vy;
 
-    // Each vector holds one 32-value Q8_0 block. The last two join the 16-byte, 8-byte and qh trit runs.
-    const __m256i c0 = _mm256_setr_epi16( 1,  1,  1,  1,  1,  1,  1,  1,  3,  3,  3,  3,  3,  3,  3,  3);
-    const __m256i c1 = _mm256_setr_epi16( 9,  9,  9,  9,  9,  9,  9,  9, 27, 27, 27, 27, 27, 27, 27, 27);
-    const __m256i c2 = _mm256_setr_epi16(81, 81, 81, 81, 81, 81, 81, 81,  1,  1,  1,  1,  3,  3,  3,  3);
-    const __m256i c3 = _mm256_setr_epi16( 9,  9,  9,  9, 27, 27, 27, 27, 81, 81, 81, 81,  1,  3,  9, 27);
-    const __m256i sh2 = _mm256_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-                                         4, 5, 6, 7, 8, 9, 10, 11, 4, 5, 6, 7, 8, 9, 10, 11);
-    const __m256i sh3 = _mm256_setr_epi8(4, 5, 6, 7, 8, 9, 10, 11, 4, 5, 6, 7, 8, 9, 10, 11,
-                                         4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 12, 13, 12, 13, 12, 13);
-
     __m256 acc = _mm256_setzero_ps();
     for (int i = 0; i < n / QK_PTQ1_0; ++i) {
-        const uint8_t * GGML_RESTRICT xb = (const uint8_t *) &x[i];
-        const __m128i a = _mm_loadu_si128((const __m128i *) xb);
-        const __m128i b = _mm_loadu_si128((const __m128i *) (xb + 12));
-        const __m256i aa = _mm256_broadcastsi128_si256(a);
-        const __m256i ab = _mm256_shuffle_epi8(_mm256_inserti128_si256(_mm256_castsi128_si256(a), b, 1), sh2);
-        const __m256i bb = _mm256_shuffle_epi8(_mm256_broadcastsi128_si256(b), sh3);
-
+        __m256i codes[4];
+        ptq1_0_unpack_128(&x[i], codes);
         const block_q8_0 * GGML_RESTRICT yb = &y[4*i];
         const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
-        const __m256i p0 = ptq1_0_dot(ptq1_0_trit(ptq1_0_mul_u8(aa, c0)), _mm256_loadu_si256((const __m256i *) yb[0].qs));
-        const __m256i p1 = ptq1_0_dot(ptq1_0_trit(ptq1_0_mul_u8(aa, c1)), _mm256_loadu_si256((const __m256i *) yb[1].qs));
-        const __m256i p2 = ptq1_0_dot(ptq1_0_trit(ptq1_0_mul_u8(ab, c2)), _mm256_loadu_si256((const __m256i *) yb[2].qs));
-        const __m256i p3 = ptq1_0_dot(ptq1_0_trit(ptq1_0_mul_u8(bb, c3)), _mm256_loadu_si256((const __m256i *) yb[3].qs));
+        const __m256i p0 = ptq1_0_dot(codes[0], _mm256_loadu_si256((const __m256i *) yb[0].qs));
+        const __m256i p1 = ptq1_0_dot(codes[1], _mm256_loadu_si256((const __m256i *) yb[1].qs));
+        const __m256i p2 = ptq1_0_dot(codes[2], _mm256_loadu_si256((const __m256i *) yb[2].qs));
+        const __m256i p3 = ptq1_0_dot(codes[3], _mm256_loadu_si256((const __m256i *) yb[3].qs));
         acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p0), _mm256_set1_ps(d0*GGML_CPU_FP16_TO_FP32(yb[0].d)), acc);
         acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p1), _mm256_set1_ps(d0*GGML_CPU_FP16_TO_FP32(yb[1].d)), acc);
         acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p2), _mm256_set1_ps(d0*GGML_CPU_FP16_TO_FP32(yb[2].d)), acc);

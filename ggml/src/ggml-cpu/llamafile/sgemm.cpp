@@ -53,6 +53,7 @@
 #include "ggml-cpu-impl.h"
 #include "ggml-quants.h"
 #include "simd-mappings.h"
+#include "../arch/x86/ptq1_0.h"
 
 #include <array>
 #include <type_traits>
@@ -4031,6 +4032,96 @@ class tinyBLAS_PQ2_AVX {
     const int64_t k, lda, ldb, ldc;
     const int ith, nth;
 };
+
+// Compact PTQ weights are unpacked once per output row and shared across token columns.
+class tinyBLAS_PTQ1_AVX {
+  public:
+    tinyBLAS_PTQ1_AVX(int64_t k, const block_ptq1_0 *A, int64_t lda, const block_q8_0 *B, int64_t ldb, float *C, int64_t ldc, int ith, int nth)
+        : A(A), B(B), C(C), k(k), lda(lda), ldb(ldb), ldc(ldc), ith(ith), nth(nth) {}
+    void matmul(int64_t m, int64_t n) { mnpack(0, m, 0, n); }
+  private:
+    void mnpack(int64_t m0, int64_t m, int64_t n0, int64_t n) {
+        int64_t mc, nc;
+        switch ((MIN(m - m0, 2) << 4) | MIN(n - n0, 2)) {
+        case 0x22: mc = 2; nc = 2; gemm<2, 2>(m0, m, n0, n); break;
+        case 0x21: mc = 2; nc = 1; gemm<2, 1>(m0, m, n0, n); break;
+        case 0x12: mc = 1; nc = 2; gemm<1, 2>(m0, m, n0, n); break;
+        case 0x11: mc = 1; nc = 1; gemm<1, 1>(m0, m, n0, n); break;
+        default: return;
+        }
+        const int64_t mp = m0 + (m - m0) / mc * mc;
+        const int64_t np = n0 + (n - n0) / nc * nc;
+        mnpack(mp, m, n0, np);
+        mnpack(m0, m, np, n);
+    }
+#if defined(_MSC_VER)
+    static __forceinline
+#elif defined(__GNUC__)
+    static __attribute__((always_inline)) inline
+#else
+    static inline
+#endif
+    __m256 madd(__m256 acc, __m256i code, __m256i qy, __m256i sy, float scale) {
+        const __m256i dot = _mm256_sub_epi32(ptq1_0_dot_u8(code, qy), sy);
+        return _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot), _mm256_set1_ps(scale), acc);
+    }
+    template <int RM, int RN>
+    NOINLINE void gemm(int64_t m0, int64_t m, int64_t n0, int64_t n) {
+        const int64_t ytiles = (m - m0) / RM;
+        const int64_t xtiles = (n - n0) / RN;
+        const int64_t tiles = xtiles * ytiles;
+        const int64_t duty = (tiles + nth - 1) / nth;
+        const int64_t start = duty * ith;
+        const int64_t end = MIN(start + duty, tiles);
+        for (int64_t job = start; job < end; ++job) {
+            const int64_t ii = m0 + job / xtiles * RM;
+            const int64_t jj = n0 + job % xtiles * RN;
+            __m256 acc00 = _mm256_setzero_ps();
+            [[maybe_unused]] __m256 acc01 = _mm256_setzero_ps();
+            [[maybe_unused]] __m256 acc10 = _mm256_setzero_ps();
+            [[maybe_unused]] __m256 acc11 = _mm256_setzero_ps();
+            for (int64_t l = 0; l < k; ++l) {
+                const block_ptq1_0 *x0 = &A[lda * ii + l];
+                [[maybe_unused]] const block_ptq1_0 *x1 = nullptr;
+                if constexpr (RM == 2) { x1 = &A[lda * (ii + 1) + l]; }
+                const float da0 = unhalf(x0->d);
+                [[maybe_unused]] float da1 = 0.0f;
+                if constexpr (RM == 2) { da1 = unhalf(x1->d); }
+                const block_q8_0 *b0 = &B[ldb * jj + 4 * l];
+                [[maybe_unused]] const block_q8_0 *b1 = nullptr;
+                if constexpr (RN == 2) { b1 = &B[ldb * (jj + 1) + 4 * l]; }
+
+                // Keep only one group live while preserving vec_dot's update order.
+                for (int group = 0; group < 4; ++group) {
+                    const __m256i code0 = ptq1_0_unpack_32(x0, group);
+                    [[maybe_unused]] __m256i code1 = _mm256_setzero_si256();
+                    if constexpr (RM == 2) { code1 = ptq1_0_unpack_32(x1, group); }
+                    const __m256i qy0 = _mm256_loadu_si256((const __m256i *) b0[group].qs);
+                    const __m256i sy0 = ptq1_0_dot_u8(_mm256_set1_epi8(1), qy0);
+                    const float db0 = unhalf(b0[group].d);
+                    acc00 = madd(acc00, code0, qy0, sy0, da0 * db0);
+                    if constexpr (RM == 2) { acc10 = madd(acc10, code1, qy0, sy0, da1 * db0); }
+                    if constexpr (RN == 2) {
+                        const __m256i qy1 = _mm256_loadu_si256((const __m256i *) b1[group].qs);
+                        const __m256i sy1 = ptq1_0_dot_u8(_mm256_set1_epi8(1), qy1);
+                        const float db1 = unhalf(b1[group].d);
+                        acc01 = madd(acc01, code0, qy1, sy1, da0 * db1);
+                        if constexpr (RM == 2) { acc11 = madd(acc11, code1, qy1, sy1, da1 * db1); }
+                    }
+                }
+            }
+            C[ldc * jj + ii] = pq2_hsum(acc00);
+            if constexpr (RM == 2) { C[ldc * jj + ii + 1] = pq2_hsum(acc10); }
+            if constexpr (RN == 2) { C[ldc * (jj + 1) + ii] = pq2_hsum(acc01); }
+            if constexpr (RM == 2 && RN == 2) { C[ldc * (jj + 1) + ii + 1] = pq2_hsum(acc11); }
+        }
+    }
+    const block_ptq1_0 *const A;
+    const block_q8_0 *const B;
+    float *const C;
+    const int64_t k, lda, ldb, ldc;
+    const int ith, nth;
+};
 #endif // __AVX2__
 
 /**
@@ -4299,6 +4390,25 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
         return false;
     }
 
+    case GGML_TYPE_PTQ1_0: {
+#if defined(__AVX2__)
+        if (Btype != GGML_TYPE_Q8_0 || params->use_ref) {
+            return false;
+        }
+        static const bool enabled = [] {
+            const char *value = getenv("GGML_PTQ1_0_GEMM");
+            return value && strcmp(value, "1") == 0;
+        }();
+        if (!enabled) {
+            return false;
+        }
+        tinyBLAS_PTQ1_AVX tb{ k, (const block_ptq1_0 *)A, lda, (const block_q8_0 *)B, ldb, (float *)C, ldc, params->ith, params->nth };
+        tb.matmul(m, n);
+        return true;
+#else
+        return false;
+#endif
+    }
     case GGML_TYPE_PQ2_0: {
 #if defined(__AVX2__)
         { static int off = -1; if (off < 0) { const char * e = getenv("PQ2_SGEMM"); off = (e && e[0] == '0') ? 1 : 0; } if (off) return false; }

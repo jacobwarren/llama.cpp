@@ -4526,6 +4526,10 @@ struct test_mul_mat : public test_case {
     }
 
     double max_nmse_err(ggml_backend_t backend) override {
+        // PTQ CPU GEMM must match the validated vec_dot path selected by use_ref.
+        if (type_a == GGML_TYPE_PTQ1_0 && ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            return 0.0;
+        }
         // for blackwell we quantize activations to mxfp4 instead of q8_1 so we add higher tolerance
         if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
             return 2e-2;
@@ -9546,6 +9550,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // PTQ GEMM tiles and both tails, including a final token after several two-token tiles.
+    for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) {
+        for (int m : {1, 2, 3}) {
+            for (int n : {2, 3, 4, 5, 7, 8, 9}) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, type_b, m, n, 128, {1, 1}, {1, 1}));
+            }
+        }
+        for (int k : {5120, 6144, 10240, 17408}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, type_b, 3, 9, k, {1, 1}, {1, 1}));
+        }
+    }
+    for (int n : {2, 4, 9}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 3, n, 5120, {2, 3}, {2, 1}, {0, 1, 2, 3}, 5248));
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_Q8_0, 3, 9, 5120, {2, 1}, {1, 2}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 3, 3, 128, {2, 3}, {1, 1}, {0, 2, 1, 3}));
 
     // BF16 is absent from base_types: add the 3 standard non-contig permutations explicitly
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 16,  1, 256, {2, 3}, {1, 1}, {0, 2, 1, 3}));
