@@ -3,7 +3,8 @@
 The private `codex/bonsai-cpu-vnni-int8` worktree starts at
 `89c4d184a1c1d1dd01fb38db2ca20bb6ff1a5881`. The shipping integration remains
 `8f2581aa5`; the validated MSVC/Clang 89c activation-tile binaries and original
-llama.cpp reference are unchanged. This slice has source/static evidence only.
+llama.cpp reference are unchanged. The signed dot has Windows Intel-host
+build, numerical and assembly qualification; model performance remains pending.
 
 The existing PTQ decoder emits byte codes 0/1/2. The original dot multiplies
 those unsigned codes by signed Q8 bytes, then subtracts an all-ones dot. The
@@ -73,7 +74,7 @@ capability evidence, not per-operation tracing; keep compact GEMM disabled
 when qualifying the signed row-dot route. The default Markdown display
 continues to show its existing selected columns.
 
-## Source tests and remaining acceptance
+## Numerical and assembly qualification
 
 The existing quantization test extends all 256 packed-byte patterns at all 128
 trit positions with -128/+127 activations to compare the safe candidate wrapper
@@ -88,18 +89,57 @@ and candidate must agree exactly; the scalar bound must stay within +/-512.
 The test prints whether the signed route is actually active. A disabled or
 unsupported-host pass is fallback evidence, not DPBSSD execution evidence.
 
-After CPU release, build both option-OFF and option-ON configurations. Run
-quantization and all 473 existing PTQ matrix cases with the signed environment
-unset/0/other/1 in separate processes, verify the active-route metadata, and
-retain source/binary identities and complete failures. Inspect the capability
-entry and ordinary objects for accidental DPBSSD, and inspect the target entry
-for inline decode/correction folding, calls, spills and update order. A masked
-or unavailable capability must retain the unsigned path without SIGILL.
+Both default-OFF and explicit-ON Clang 19.1.5 Release builds passed at clean
+tested code pin `dec410b6faefb55d3e87aeb4fe1e8327cefda3b1`. Documentation
+qualification is recorded separately and does not require rebuilding that
+binary. Configuration matches the validated 89c Clang native-pool baseline:
+`GGML_NATIVE=OFF`, AVX/AVX2/AVX-VNNI/FMA/F16C enabled, OpenMP/CUDA/AVX512/BMI2
+disabled, shared libraries and llamafile enabled, with C flags
+`/clang:-mavxvnni` and C++ flags `/EHsc /clang:-mavxvnni`. Only the ON
+configuration adds `GGML_PTQ_VNNI_INT8=ON`; its isolated intrinsic/target probe
+passed. The build targets were `llama-bench`, `test-quantize-fns` and
+`test-backend-ops`.
 
-No native compile, execution, model read/hash or performance benchmark has run
-in this source-only slice. Intel-host numerical/dispatch/assembly acceptance,
-portable default-OFF builds and unavailable-feature behavior remain pending.
-Only the current Intel development machine is available; AMD and macOS runtime
-results are unmeasured. The root task owns subsequent serial single-decode
-controls, model quality/cancellation and performance attribution. ISA source
-evidence does not imply a generated-throughput gain or close the CPU ledger.
+Separate processes for each build and signed environment unset/0/other/1
+passed the complete quantization test with zero failures, including 65,536
+one-hot comparisons, 2880 isolated integer-lane comparisons and 28 real-K
+mixed-scale comparisons. Only ON plus environment 1 printed
+`ptq1_0 signed-dot route active: 1`; the seven fallback processes printed 0.
+Every process also passed all 473 PTQ MUL_MAT cases against the unchanged
+reference at zero allowed NMSE, including all 30 raw signed-byte fixtures.
+Compact GEMM was unset or 0 in these matrix controls. The matched filter was
+`test-backend-ops test -b CPU -o MUL_MAT -p type_a=ptq1_0`; available operations
+were checked before filtering. Quantization and matrix deadlines were 120 and
+300 seconds respectively, with no timeout.
+
+Three model-free, fresh-process calls to the public system-info API verified
+the effective `PTQ_VNNI_INT8 = 1` string only for ON plus environment 1, absent
+for ON plus environment 0 and OFF plus environment 1. The new llama-bench
+serialization compiled and received independent source review; full benchmark
+JSON attestation remains part of the root-owned model comparison. An explicit
+MSVC ON configure was rejected for the intended unsupported-compiler reason.
+The first default-OFF compile exposed a private-header include-path error;
+the complete failed log was retained and the relative include was fixed in
+`596db1d54` before final successful builds. An unavailable physical CPU was
+not available to execute the capability-false branch; that gate has source
+and emitted-control-flow review, while disabled-build/environment fallbacks
+were executed. AMD and macOS runtime remain unmeasured.
+
+An assembly audit covered all 31 OFF/ON CPU objects and found DPBSSD only in
+the private static target: four instructions per 128-K iteration. Its K loop
+at offsets 0xf0..0x25d has 75 listed instructions, four FMA updates and no
+stack operands or calls, versus the original unsigned loop's 98 instructions,
+eight DPBUSD instructions and four FMA updates. Both loops retain their
+floating accumulator in registers. The candidate's 0xc8 frame holds Win64
+XMM saves and shadow/alignment space; its one call is a cold assertion path.
+LLVM folded code-minus-one conversion into threshold-mask subtraction, so no
+extra signed-decoder rewrite was needed. Independent relocation/control-flow
+review confirmed the CPU/OS/env gate precedes XGETBV and selects the original
+entry when false. Static instruction counts do not establish throughput.
+
+Complete commands, source/binary/cache/object identities, failures, numeric
+outputs and assembly evidence are retained in the Rig evidence directory
+`artifacts/bonsai-cpu/20261006/vnni-int8-validation/`. No model was read/hashed
+or run by this native slice. The root task owns serial single-decode controls,
+model quality/cancellation and performance attribution. Qualification does
+not imply a generated-throughput gain or close the CPU ledger.
