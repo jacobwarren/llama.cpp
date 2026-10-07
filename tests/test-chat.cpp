@@ -8,6 +8,7 @@
 #include "../src/llama-grammar.h"
 #include "../src/unicode.h"
 #include "../tools/server/server-chat.h"
+#include "../tools/server/server-task.h"
 #include "chat-auto-parser.h"
 #include "chat.h"
 #include "common.h"
@@ -7154,6 +7155,56 @@ static void test_msg_diffs_compute() {
     }
 }
 
+static void test_responses_reasoning_content_index() {
+    server_task_result_cmpl_partial partial{};
+    partial.oai_resp_created      = true;
+    partial.oai_resp_reasoning_id = "rs_fixture";
+
+    common_chat_msg_diff diff{};
+    diff.reasoning_content_delta = "fixture-first";
+    partial.oaicompat_msg_diffs   = {diff};
+    const json first = partial.to_json_oaicompat_resp();
+    assert_equals(size_t(2), first.size());
+    assert_equals(std::string("response.output_item.added"), first.at(0).at("event").get<std::string>());
+    assert_equals(partial.oai_resp_reasoning_id, first.at(0).at("data").at("item").at("id").get<std::string>());
+    assert_equals(std::string("reasoning"), first.at(0).at("data").at("item").at("type").get<std::string>());
+    assert_equals(json({{"type", "response.reasoning_text.delta"}, {"delta", "fixture-first"}, {"item_id", "rs_fixture"}, {"content_index", 0}}), first.at(1).at("data"));
+    assert_equals(true, first.at(1).at("data").at("content_index").is_number_integer());
+    assert_equals(true, partial.thinking_block_started);
+
+    diff.reasoning_content_delta = "fixture-next";
+    partial.oaicompat_msg_diffs   = {diff};
+    const json next = partial.to_json_oaicompat_resp();
+    assert_equals(size_t(1), next.size());
+    assert_equals(json({{"type", "response.reasoning_text.delta"}, {"delta", "fixture-next"}, {"item_id", "rs_fixture"}, {"content_index", 0}}), next.at(0).at("data"));
+    assert_equals(true, next.at(0).at("data").at("content_index").is_number_integer());
+
+    server_task_result_cmpl_final final{};
+    final.oai_resp_reasoning_id             = partial.oai_resp_reasoning_id;
+    final.oaicompat_msg.reasoning_content   = "fixture-firstfixture-next";
+    const json done = final.to_json_oaicompat_resp_stream();
+    const json & item = done.at(0).at("data").at("item");
+    assert_equals(std::string("response.output_item.done"), done.at(0).at("event").get<std::string>());
+    assert_equals(partial.oai_resp_reasoning_id, item.at("id").get<std::string>());
+    assert_equals(size_t(1), item.at("content").size());
+    assert_equals(std::string("reasoning_text"), item.at("content").at(0).at("type").get<std::string>());
+    assert_equals(final.oaicompat_msg.reasoning_content, item.at("content").at(0).at("text").get<std::string>());
+
+    server_task_result_cmpl_partial text_only{};
+    text_only.oai_resp_created    = true;
+    text_only.oai_resp_message_id = "msg_fixture";
+    diff.reasoning_content_delta = "";
+    diff.content_delta           = "fixture-output";
+    text_only.oaicompat_msg_diffs = {diff};
+    const json text = text_only.to_json_oaicompat_resp();
+    assert_equals(size_t(3), text.size());
+    assert_equals(std::string("response.output_item.added"), text.at(0).at("event").get<std::string>());
+    assert_equals(std::string("message"), text.at(0).at("data").at("item").at("type").get<std::string>());
+    assert_equals(std::string("response.content_part.added"), text.at(1).at("event").get<std::string>());
+    assert_equals(json({{"type", "response.output_text.delta"}, {"item_id", "msg_fixture"}, {"delta", "fixture-output"}}), text.at(2).at("data"));
+    assert_equals(false, text_only.thinking_block_started);
+}
+
 int main(int argc, char ** argv) {
     bool detailed_debug    = false;
     bool only_run_filtered = false;
@@ -7227,6 +7278,7 @@ int main(int argc, char ** argv) {
 #endif
     {
         test_msg_diffs_compute();
+        test_responses_reasoning_content_index();
         test_msgs_oaicompat_json_conversion();
         test_msg_token_delimiters_split();
         test_tools_oaicompat_json_conversion();
