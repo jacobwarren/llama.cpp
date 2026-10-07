@@ -321,8 +321,8 @@ json server_checkpoint_bundle_native_layout(
     json s = json::array();
     for (uint32_t il = 0; il < n_layer; ++il) {
         if (hp.is_recr_impl[il]) {
-            r.push_back({ {"type", GGML_TYPE_F32}, {"row_bytes", n_embd_r * sizeof(float)} });
-            s.push_back({ {"type", GGML_TYPE_F32}, {"row_bytes", n_embd_s * sizeof(float)} });
+            r.push_back({ {"type", static_cast<int32_t>(GGML_TYPE_F32)}, {"row_bytes", n_embd_r * sizeof(float)} });
+            s.push_back({ {"type", static_cast<int32_t>(GGML_TYPE_F32)}, {"row_bytes", n_embd_s * sizeof(float)} });
             continue;
         }
         require(hp.n_layer_kv_from_start < 0 || il < static_cast<uint32_t>(hp.n_layer_kv_from_start), "Unsupported native bundle attention filter");
@@ -330,8 +330,8 @@ json server_checkpoint_bundle_native_layout(
         const uint64_t n_embd_v = static_cast<uint64_t>(hp.n_embd_head_v_full) * hp.n_head_kv_arr[il];
         require(n_embd_k > 0 && n_embd_k <= SERVER_CHECKPOINT_BUNDLE_MAX_BYTES && n_embd_k % ggml_blck_size(type_k) == 0 &&
                 n_embd_v > 0 && n_embd_v <= SERVER_CHECKPOINT_BUNDLE_MAX_BYTES && n_embd_v % ggml_blck_size(type_v) == 0, "Invalid native bundle attention row geometry");
-        keys.push_back({ {"type", type_k}, {"row_bytes", ggml_row_size(type_k, static_cast<int64_t>(n_embd_k))} });
-        values.push_back({ {"type", type_v}, {"row_bytes", ggml_row_size(type_v, static_cast<int64_t>(n_embd_v))} });
+        keys.push_back({ {"type", static_cast<int32_t>(type_k)}, {"row_bytes", ggml_row_size(type_k, static_cast<int64_t>(n_embd_k))} });
+        values.push_back({ {"type", static_cast<int32_t>(type_v)}, {"row_bytes", ggml_row_size(type_v, static_cast<int64_t>(n_embd_v))} });
     }
     require(!keys.empty() && !r.empty(), "Native bundles require both attention and recurrent layers");
     const auto rope_type = llama_model_rope_type(model);

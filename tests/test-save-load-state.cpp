@@ -77,11 +77,11 @@ static int test_checkpoint_bundle_envelope() {
 
     const json shape = {
         {"n_stream", 1}, {"pos_per_embd", 4}, {"v_trans", false},
-        {"attention_keys", json::array({json{{"type", GGML_TYPE_Q8_0}, {"row_bytes", 34}}})},
-        {"attention_values", json::array({json{{"type", GGML_TYPE_Q8_0}, {"row_bytes", 34}}})},
+        {"attention_keys", json::array({json{{"type", static_cast<int32_t>(GGML_TYPE_Q8_0)}, {"row_bytes", 34}}})},
+        {"attention_values", json::array({json{{"type", static_cast<int32_t>(GGML_TYPE_Q8_0)}, {"row_bytes", 34}}})},
         {"recurrent_layers", 2},
-        {"recurrent_r", json::array({json{{"type", GGML_TYPE_F32}, {"row_bytes", 4}}})},
-        {"recurrent_s", json::array({json{{"type", GGML_TYPE_F32}, {"row_bytes", 4}}})},
+        {"recurrent_r", json::array({json{{"type", static_cast<int32_t>(GGML_TYPE_F32)}, {"row_bytes", 4}}})},
+        {"recurrent_s", json::array({json{{"type", static_cast<int32_t>(GGML_TYPE_F32)}, {"row_bytes", 4}}})},
     };
     const json identity = {
         {"model_sha256", std::string(64, 'a')}, {"engine", {{"commit", "test"}}},
