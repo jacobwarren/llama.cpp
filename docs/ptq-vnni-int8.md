@@ -15,8 +15,8 @@ needed. Q8 bytes are never negated. The original four group updates, FP16 scales
 per 128 weights/per 32 activations, FMA order and horizontal reduction remain.
 
 [Intel's instruction reference](https://cdrdv2-public.intel.com/819680/architecture-instruction-set-extensions-programming-reference.pdf)
-identifies CPUID 7.1 EDX bit 4 for AVX-VNNI-INT8 (PDF page 30) and VEX.256
-VPDPBSSD's signed-byte products (PDF page 118). The local Clang 19.1.5 header
+identifies CPUID 7.1 EDX bit 4 for AVX-VNNI-INT8 (printed page 1-12) and VEX.256
+VPDPBSSD's signed-byte products (printed page 2-46). The local Clang 19.1.5 header
 `avxvnniint8intrin.h` declares the corresponding intrinsic with an
 `avxvnniint8` function target;
 [LLVM's header reference](https://clang.llvm.org/doxygen/avxvnniint8intrin_8h.html)
