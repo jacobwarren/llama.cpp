@@ -4680,6 +4680,36 @@ struct test_ptq_activation_tile : public test_mul_mat {
     }
 };
 
+struct test_ptq_lookup_witness : public test_mul_mat {
+    test_ptq_lookup_witness(int64_t m) : test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_Q8_0, m, 1, 128, {1, 1}, {1, 1}) {}
+
+    std::string vars() override { return test_mul_mat::vars() + ",lookup_witness=1"; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
+            if (tensor->type == GGML_TYPE_PTQ1_0) {
+                std::vector<block_ptq1_0> blocks(ggml_nelements(tensor) / QK_PTQ1_0);
+                float weights[QK_PTQ1_0] = {};
+                for (int t = 0; t < 4; ++t) { weights[t] = -1.0f; weights[64 + t] = 1.0f; }
+                weights[36] = 1.0f;
+                for (auto & block : blocks) {
+                    ggml_get_type_traits(GGML_TYPE_PTQ1_0)->from_float_ref(weights, &block, QK_PTQ1_0);
+                    block.d = ggml_fp32_to_fp16(256.0f);
+                }
+                ggml_backend_tensor_set(tensor, blocks.data(), 0, blocks.size() * sizeof(blocks[0]));
+            } else if (tensor->type == GGML_TYPE_Q8_0) {
+                block_q8_0 blocks[4] = {};
+                const float scales[4] = {128.0f, 1.0f / 256.0f, 128.0f, 1.0f};
+                for (int group = 0; group < 4; ++group) { blocks[group].d = ggml_fp32_to_fp16(scales[group]); }
+                for (int t = 0; t < 4; ++t) { blocks[0].qs[t] = -128; blocks[2].qs[t] = -128; }
+                blocks[1].qs[4] = 1;
+                ggml_backend_tensor_set(tensor, blocks, 0, sizeof(blocks));
+            }
+        }
+    }
+};
+
 #define P 1.0f
 #define N -1.0f
 
@@ -9624,6 +9654,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int k : {5120, 6144, 10240, 17408}) {
             test_cases.emplace_back(new test_ptq_activation_tile(3, 17, k, pattern));
         }
+    }
+
+    // Lookup mat-vec full four-row tiles, tails and real projection widths.
+    for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) {
+        for (int k : {128, 384, 2048, 5120, 6144, 10240, 17408}) {
+            for (int m : {4, 5, 6, 7, 8, 9}) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, type_b, m, 1, k, {1, 1}, {1, 1}));
+            }
+        }
+    }
+    for (int m : {4, 5, 7, 8, 9}) {
+        test_cases.emplace_back(new test_ptq_lookup_witness(m));
+        for (int k : {128, 6144, 17408}) {
+            for (int pattern : {0, 1, 2}) { test_cases.emplace_back(new test_ptq_activation_tile(m, 1, k, pattern)); }
+        }
+    }
+    for (int n : {1, 2, 4}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 5, n, 5120, {2, 3}, {2, 1}, {0, 1, 2, 3}, 5248));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_Q8_0, 7, n, 5120, {2, 1}, {1, 2}));
     }
 
     // BF16 is absent from base_types: add the 3 standard non-contig permutations explicitly

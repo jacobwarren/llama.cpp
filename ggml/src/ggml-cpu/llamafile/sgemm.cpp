@@ -53,9 +53,11 @@
 #include "ggml-cpu-impl.h"
 #include "ggml-quants.h"
 #include "simd-mappings.h"
+#include "../quants.h"
 #include "../arch/x86/ptq1_0.h"
 
 #include <array>
+#include <climits>
 #include <type_traits>
 #include <cstdlib>
 #include <cstring>
@@ -4033,6 +4035,101 @@ class tinyBLAS_PQ2_AVX {
     const int ith, nth;
 };
 
+struct ptq_lut_control {
+    uint8_t mirror;
+    uint8_t singleton;
+};
+
+struct alignas(32) ptq_lut_scratch {
+    ptq_lut_control controls[4][4][8];
+    uint8_t table[8][2][16];
+    int16_t lanes[8][4];
+    int16_t singletons[8];
+    __m256i unpacked[4];
+    uint8_t bytes[32];
+};
+static_assert(sizeof(ptq_lut_scratch) == 768, "bounded PTQ lookup scratch");
+
+static void ptq_lut_controls(const uint8_t * codes, ptq_lut_control * controls) {
+    for (int lane = 0; lane < 8; ++lane) {
+        const int m = 9 * (static_cast<int>(codes[4 * lane]) - 1) +
+                      3 * (static_cast<int>(codes[4 * lane + 1]) - 1) + static_cast<int>(codes[4 * lane + 2]) - 1;
+        controls[lane].mirror = static_cast<uint8_t>((m < 0 ? -m : m) | (m < 0 ? 0x80 : 0));
+        controls[lane].singleton = codes[4 * lane + 3];
+    }
+}
+
+static void ptq_lut_prepare(ptq_lut_scratch & scratch, const int8_t * values) {
+    for (int lane = 0; lane < 8; ++lane) {
+        const int a = values[4 * lane], b = values[4 * lane + 1], c = values[4 * lane + 2];
+        const int ab_sub = a - b, ab_add = a + b;
+        const int16_t table[16] = {0, static_cast<int16_t>(c), static_cast<int16_t>(b - c), static_cast<int16_t>(b),
+            static_cast<int16_t>(b + c), static_cast<int16_t>(ab_sub - c), static_cast<int16_t>(ab_sub),
+            static_cast<int16_t>(ab_sub + c), static_cast<int16_t>(a - c), static_cast<int16_t>(a),
+            static_cast<int16_t>(a + c), static_cast<int16_t>(ab_add - c), static_cast<int16_t>(ab_add),
+            static_cast<int16_t>(ab_add + c), 0, 0};
+        for (int index = 0; index < 16; ++index) {
+            const uint16_t bits = static_cast<uint16_t>(table[index]);
+            scratch.table[lane][0][index] = static_cast<uint8_t>(bits);
+            scratch.table[lane][1][index] = static_cast<uint8_t>(bits >> 8);
+        }
+        scratch.singletons[lane] = values[4 * lane + 3];
+    }
+}
+
+static void ptq_lut_lookup(ptq_lut_scratch & scratch, int group) {
+    for (int lane = 0; lane < 8; ++lane) {
+        const auto & c0 = scratch.controls[0][group][lane];
+        const auto & c1 = scratch.controls[1][group][lane];
+        const auto & c2 = scratch.controls[2][group][lane];
+        const auto & c3 = scratch.controls[3][group][lane];
+        const __m128i indices = _mm_setr_epi8(c0.mirror & 15, c1.mirror & 15, c2.mirror & 15, c3.mirror & 15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        const __m128i lo = _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i *>(scratch.table[lane][0])), indices);
+        const __m128i hi = _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i *>(scratch.table[lane][1])), indices);
+        const __m128i signs = _mm_setr_epi16(c0.mirror & 0x80 ? -1 : 1, c1.mirror & 0x80 ? -1 : 1,
+                                           c2.mirror & 0x80 ? -1 : 1, c3.mirror & 0x80 ? -1 : 1, 0, 0, 0, 0);
+        const __m128i singleton = _mm_setr_epi16(c0.singleton - 1, c1.singleton - 1, c2.singleton - 1, c3.singleton - 1, 0, 0, 0, 0);
+        const __m128i triple = _mm_sign_epi16(_mm_unpacklo_epi8(lo, hi), signs);
+        const __m128i last = _mm_mullo_epi16(singleton, _mm_set1_epi16(scratch.singletons[lane]));
+        _mm_storel_epi64(reinterpret_cast<__m128i *>(scratch.lanes[lane]), _mm_add_epi16(triple, last));
+    }
+}
+
+static __m256i ptq_lut_row(const ptq_lut_scratch & scratch, int row) {
+    return _mm256_setr_epi32(scratch.lanes[0][row], scratch.lanes[1][row], scratch.lanes[2][row], scratch.lanes[3][row],
+                            scratch.lanes[4][row], scratch.lanes[5][row], scratch.lanes[6][row], scratch.lanes[7][row]);
+}
+
+NOINLINE static void ptq_lut_dot4(int64_t k, const block_ptq1_0 * A, int64_t lda, const block_q8_0 * B, float * C) {
+    ptq_lut_scratch scratch;
+    __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+    for (int64_t block = 0; block < k; ++block) {
+        float scales[4];
+        for (int row = 0; row < 4; ++row) {
+            const block_ptq1_0 * x = &A[row * lda + block];
+            ptq1_0_unpack_128(x, scratch.unpacked);
+            scales[row] = unhalf(x->d);
+            for (int group = 0; group < 4; ++group) {
+                _mm256_storeu_si256(reinterpret_cast<__m256i *>(scratch.bytes), scratch.unpacked[group]);
+                ptq_lut_controls(scratch.bytes, scratch.controls[row][group]);
+            }
+        }
+        for (int group = 0; group < 4; ++group) {
+            const block_q8_0 * y = &B[4 * block + group];
+            ptq_lut_prepare(scratch, y->qs);
+            ptq_lut_lookup(scratch, group);
+            const float dy = unhalf(y->d);
+            acc0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(ptq_lut_row(scratch, 0)), _mm256_set1_ps(scales[0] * dy), acc0);
+            acc1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(ptq_lut_row(scratch, 1)), _mm256_set1_ps(scales[1] * dy), acc1);
+            acc2 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(ptq_lut_row(scratch, 2)), _mm256_set1_ps(scales[2] * dy), acc2);
+            acc3 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(ptq_lut_row(scratch, 3)), _mm256_set1_ps(scales[3] * dy), acc3);
+        }
+    }
+    C[0] = pq2_hsum(acc0); C[1] = pq2_hsum(acc1);
+    C[2] = pq2_hsum(acc2); C[3] = pq2_hsum(acc3);
+}
+
 // Compact PTQ weights are unpacked once per output row and shared across token columns.
 class tinyBLAS_PTQ1_AVX {
   public:
@@ -4045,6 +4142,21 @@ class tinyBLAS_PTQ1_AVX {
             mnpack(0, m, np, n);
         } else {
             mnpack(0, m, 0, n);
+        }
+    }
+    void matvec_lut(int64_t m, ggml_vec_dot_t vec_dot) {
+        const int64_t tiles = m / 4;
+        const int64_t jobs = tiles + m % 4;
+        const int64_t duty = (jobs + nth - 1) / nth;
+        const int64_t start = duty * ith;
+        const int64_t end = MIN(start + duty, jobs);
+        for (int64_t job = start; job < end; ++job) {
+            if (job < tiles) {
+                ptq_lut_dot4(k, &A[lda * job * 4], lda, B, &C[job * 4]);
+            } else {
+                const int64_t row = tiles * 4 + job - tiles;
+                vec_dot(k * QK_PTQ1_0, &C[row], 0, &A[lda * row], 0, B, 0, 1);
+            }
         }
     }
   private:
@@ -4178,6 +4290,44 @@ class tinyBLAS_PTQ1_AVX {
 };
 #endif // __AVX2__
 
+bool ggml_cpu_ptq_lut_lanes(const uint8_t * codes, const int8_t * values, int32_t * lanes, int32_t * original) {
+#if defined(__AVX2__)
+    if (!ggml_cpu_ptq_lut_enabled()) {
+        return false;
+    }
+    ptq_lut_scratch scratch;
+    for (int row = 0; row < 4; ++row) {
+        ptq_lut_controls(codes + 32 * row, scratch.controls[row][0]);
+    }
+    ptq_lut_prepare(scratch, values);
+    ptq_lut_lookup(scratch, 0);
+    const __m256i qy = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(values));
+    for (int row = 0; row < 4; ++row) {
+        _mm256_storeu_si256(reinterpret_cast<__m256i *>(lanes + 8 * row), ptq_lut_row(scratch, row));
+        const __m256i qx = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(codes + 32 * row));
+        _mm256_storeu_si256(reinterpret_cast<__m256i *>(original + 8 * row), ptq1_0_dot(qx, qy));
+    }
+    return true;
+#else
+    GGML_UNUSED(codes); GGML_UNUSED(values); GGML_UNUSED(lanes); GGML_UNUSED(original);
+    return false;
+#endif
+}
+
+void ggml_vec_dot_ptq1_0_q8_0_lut4(int n, float * s, size_t bx, const void * vx, const void * vy) {
+    GGML_ASSERT(n % QK_PTQ1_0 == 0 && bx >= static_cast<size_t>(n / QK_PTQ1_0) * sizeof(block_ptq1_0));
+#if defined(__AVX2__)
+    if (ggml_cpu_ptq_lut_enabled() && bx % sizeof(block_ptq1_0) == 0) {
+        ptq_lut_dot4(n / QK_PTQ1_0, static_cast<const block_ptq1_0 *>(vx), bx / sizeof(block_ptq1_0),
+                     static_cast<const block_q8_0 *>(vy), s);
+        return;
+    }
+#endif
+    for (int row = 0; row < 4; ++row) {
+        ggml_vec_dot_ptq1_0_q8_0(n, &s[row], 0, static_cast<const char *>(vx) + row * bx, 0, vy, 0, 1);
+    }
+}
+
 /**
  * Performs optimized matrix multiplication on CPU.
  *
@@ -4220,6 +4370,21 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
     assert(ldc >= m);
     assert(params->nth > 0);
     assert(params->ith < params->nth);
+
+    // The lookup mat-vec uses the existing Q8 preparation and thread owner.
+#if defined(__AVX2__)
+    if (n == 1 && m >= 4 && k <= INT_MAX / QK_PTQ1_0 && Atype == GGML_TYPE_PTQ1_0 && Btype == GGML_TYPE_Q8_0 &&
+        Ctype == GGML_TYPE_F32 && !params->use_ref && ldb >= 4 * k && ggml_cpu_ptq_lut_enabled()) {
+        ggml_vec_dot_t vec_dot = ggml_vec_dot_ptq1_0_q8_0;
+#ifdef GGML_USE_PTQ_VNNI_INT8
+        vec_dot = ggml_cpu_ptq_vnni_int8_dot();
+#endif
+        tinyBLAS_PTQ1_AVX tb{k, static_cast<const block_ptq1_0 *>(A), lda, static_cast<const block_q8_0 *>(B), ldb,
+                            static_cast<float *>(C), ldc, params->ith, params->nth};
+        tb.matvec_lut(m, vec_dot);
+        return true;
+    }
+#endif
 
     // only enable sgemm for prompt processing
 #if !defined(__MMA__)

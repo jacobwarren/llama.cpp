@@ -48,6 +48,10 @@ void ggml_vec_dot_pq2_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 void ggml_vec_dot_ptq1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 GGML_BACKEND_API int ggml_cpu_ptq_vnni_int8_enabled(void);
 GGML_BACKEND_API void ggml_vec_dot_ptq1_0_q8_0_vnni_int8(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+GGML_BACKEND_API int ggml_cpu_ptq_lut_available(void);
+GGML_BACKEND_API int ggml_cpu_ptq_lut_enabled(void);
+GGML_BACKEND_API bool ggml_cpu_ptq_lut_lanes(const uint8_t * codes, const int8_t * values, int32_t * lanes, int32_t * original);
+GGML_BACKEND_API void ggml_vec_dot_ptq1_0_q8_0_lut4(int n, float * s, size_t bx, const void * vx, const void * vy);
 #ifdef GGML_USE_PTQ_VNNI_INT8
 int ggml_cpu_ptq_vnni_int8_available(void);
 ggml_vec_dot_t ggml_cpu_ptq_vnni_int8_dot(void);

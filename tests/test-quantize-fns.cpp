@@ -7,6 +7,7 @@
 
 #undef NDEBUG
 #include <assert.h>
+#include <cstring>
 #include <math.h>
 #include <stdio.h>
 #include <string>
@@ -423,6 +424,127 @@ static int test_vec_dot_ptq1_0(bool verbose) {
     return num_failed;
 }
 
+static int test_vec_dot_ptq1_0_lut(bool verbose) {
+    const auto * traits = ggml_get_type_traits(GGML_TYPE_PTQ1_0);
+    const auto * cpu = ggml_get_type_traits_cpu(GGML_TYPE_PTQ1_0);
+    int failed = 0, integer_checks = 0;
+    const bool active = ggml_cpu_ptq_lut_enabled() != 0;
+    if (active) {
+        uint8_t codes[4 * 32];
+        int8_t values[32];
+        int32_t lanes[4 * 8], original[4 * 8];
+        const int patterns[5][4] = {{-128, -128, -128, -128}, {127, 127, 127, 127},
+                                   {-128, 127, -128, 127}, {-128, -1, 0, 1}, {127, 1, 0, -1}};
+        for (int quad = 0; quad < 81; ++quad) {
+            for (const auto & pattern : patterns) {
+                for (int lane = 0; lane < 8; ++lane) {
+                    for (int t = 0; t < 4; ++t) {
+                        values[4 * lane + t] = static_cast<int8_t>(pattern[(t + lane) % 4]);
+                    }
+                    for (int row = 0; row < 4; ++row) {
+                        int encoding = (quad + 7 * lane + 17 * row) % 81;
+                        for (int t = 0; t < 4; ++t) {
+                            codes[32 * row + 4 * lane + t] = encoding % 3;
+                            encoding /= 3;
+                        }
+                    }
+                }
+                GGML_ASSERT(ggml_cpu_ptq_lut_lanes(codes, values, lanes, original));
+                for (int row = 0; row < 4; ++row) {
+                    for (int lane = 0; lane < 8; ++lane) {
+                        int triple = 0, expected = 0;
+                        for (int t = 0; t < 4; ++t) {
+                            const int product = (static_cast<int>(codes[32 * row + 4 * lane + t]) - 1) * values[4 * lane + t];
+                            expected += product;
+                            if (t < 3) { triple += product; }
+                        }
+                        failed += triple < -384 || triple > 384 || expected < -512 || expected > 512 ||
+                                  lanes[8 * row + lane] != expected || original[8 * row + lane] != expected;
+                        ++integer_checks;
+                    }
+                }
+            }
+        }
+        for (int value = -384; value <= 384; ++value) {
+            for (int lane = 0; lane < 8; ++lane) {
+                int remaining = value < 0 ? value : -value;
+                for (int t = 0; t < 3; ++t) {
+                    values[4 * lane + t] = static_cast<int8_t>(remaining < -128 ? -128 : remaining);
+                    remaining -= values[4 * lane + t];
+                }
+                values[4 * lane + 3] = -128;
+                for (int row = 0; row < 4; ++row) {
+                    for (int t = 0; t < 3; ++t) {
+                        codes[32 * row + 4 * lane + t] = value == 0 ? 1 : value > 0 ? 0 : 2;
+                    }
+                    codes[32 * row + 4 * lane + 3] = 1;
+                }
+            }
+            GGML_ASSERT(ggml_cpu_ptq_lut_lanes(codes, values, lanes, original));
+            for (int i = 0; i < 32; ++i) {
+                failed += lanes[i] != value || original[i] != value;
+                ++integer_checks;
+            }
+        }
+    }
+
+    block_ptq1_0 witness[4] = {};
+    block_q8_0 acts[4] = {};
+    float weights[QK_PTQ1_0] = {};
+    for (int t = 0; t < 4; ++t) { weights[t] = -1.0f; weights[64 + t] = 1.0f; }
+    weights[36] = 1.0f;
+    for (int row = 0; row < 4; ++row) {
+        traits->from_float_ref(weights, &witness[row], QK_PTQ1_0);
+        witness[row].d = ggml_fp32_to_fp16(256.0f);
+    }
+    const float witness_scales[4] = {128.0f, 1.0f / 256.0f, 128.0f, 1.0f};
+    for (int group = 0; group < 4; ++group) { acts[group].d = ggml_fp32_to_fp16(witness_scales[group]); }
+    for (int t = 0; t < 4; ++t) { acts[0].qs[t] = -128; acts[2].qs[t] = -128; }
+    acts[1].qs[4] = 1;
+    float result[4];
+    ggml_vec_dot_ptq1_0_q8_0_lut4(QK_PTQ1_0, result, sizeof(witness[0]), witness, acts);
+    for (int row = 0; row < 4; ++row) {
+        float original;
+        cpu->vec_dot(QK_PTQ1_0, &original, 0, &witness[row], 0, acts, 0, 1);
+        failed += original != 1.0f || std::memcmp(&result[row], &original, sizeof(float)) != 0;
+    }
+
+    for (int n : {128, 384, 2048, 5120, 6144, 10240, 17408}) {
+        const int nb = n / QK_PTQ1_0;
+        std::vector<block_ptq1_0> ptq(4 * nb);
+        std::vector<block_q8_0> q8(4 * nb);
+        for (int pattern = 0; pattern < 4; ++pattern) {
+            for (int row = 0; row < 4; ++row) {
+                for (int block = 0; block < nb; ++block) {
+                    auto & x = ptq[row * nb + block];
+                    x.d = ggml_fp32_to_fp16(0.0153f + 0.0307f * ((block + row) % 11));
+                    for (size_t j = 0; j < sizeof(x.qs); ++j) { x.qs[j] = static_cast<uint8_t>(pattern * 83 + row * 29 + block * 31 + j * 17); }
+                    for (size_t j = 0; j < sizeof(x.qh); ++j) { x.qh[j] = static_cast<uint8_t>(pattern * 47 + row * 43 + block * 23 + j * 37); }
+                }
+            }
+            for (size_t block = 0; block < q8.size(); ++block) {
+                q8[block].d = ggml_fp32_to_fp16(0.003f + 0.017f * (block % 7));
+                for (int j = 0; j < QK8_0; ++j) {
+                    q8[block].qs[j] = static_cast<int8_t>(static_cast<int>((pattern * 59 + block * 13 + j * 37) % 256) - 128);
+                }
+            }
+            ggml_vec_dot_ptq1_0_q8_0_lut4(n, result, nb * sizeof(ptq[0]), ptq.data(), q8.data());
+            for (int row = 0; row < 4; ++row) {
+                float original;
+                cpu->vec_dot(n, &original, 0, &ptq[row * nb], 0, q8.data(), 0, 1);
+                const bool mismatch = std::memcmp(&result[row], &original, sizeof(float)) != 0;
+                failed += mismatch;
+                if (mismatch) { printf("ptq1_0 LUT mixed-scale n=%d pattern=%d row=%d: FAILED\n", n, pattern, row); }
+            }
+        }
+    }
+    if (failed || verbose) {
+        printf("ptq1_0 LUT ordered lanes, byte recovery and FP witness: %s (%d failures, %d integer comparisons)\n", RESULT_STR[failed != 0], failed, integer_checks);
+        printf("ptq1_0 LUT route available: %d active: %d\n", ggml_cpu_ptq_lut_available(), active);
+    }
+    return failed;
+}
+
 int main(int argc, char * argv[]) {
     bool verbose = false;
 
@@ -446,6 +568,7 @@ int main(int argc, char * argv[]) {
     num_failed += test_vec_dot_q(verbose);
     num_failed += test_vec_dot_ternary(verbose);
     num_failed += test_vec_dot_ptq1_0(verbose);
+    num_failed += test_vec_dot_ptq1_0_lut(verbose);
 
     if (num_failed || verbose) {
         printf("%d tests failed\n", num_failed);

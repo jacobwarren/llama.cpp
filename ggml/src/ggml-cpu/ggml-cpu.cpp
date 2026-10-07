@@ -8,6 +8,8 @@
 #include "amx/amx.h"
 
 #include <cctype>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -36,6 +38,35 @@
 #if defined(__APPLE__)
 #    include <sys/sysctl.h>
 #    include <sys/types.h>
+#endif
+
+int ggml_cpu_ptq_lut_available(void) {
+#if defined(GGML_USE_LLAMAFILE) && defined(__AVX2__)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int ggml_cpu_ptq_lut_enabled(void) {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_PTQ1_0_LUT");
+        return ggml_cpu_ptq_lut_available() && value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+#ifndef GGML_USE_LLAMAFILE
+bool ggml_cpu_ptq_lut_lanes(const uint8_t * codes, const int8_t * values, int32_t * lanes, int32_t * original) {
+    GGML_UNUSED(codes); GGML_UNUSED(values); GGML_UNUSED(lanes); GGML_UNUSED(original);
+    return false;
+}
+
+void ggml_vec_dot_ptq1_0_q8_0_lut4(int n, float * s, size_t bx, const void * vx, const void * vy) {
+    for (int row = 0; row < 4; ++row) {
+        ggml_vec_dot_ptq1_0_q8_0(n, &s[row], 0, static_cast<const char *>(vx) + row * bx, 0, vy, 0, 1);
+    }
+}
 #endif
 
 // ggml-backend interface
@@ -555,6 +586,12 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
         }
         if (ggml_cpu_ptq_vnni_int8_enabled()) {
             features.push_back({ "PTQ_VNNI_INT8", "1" });
+        }
+        if (ggml_cpu_ptq_lut_available()) {
+            features.push_back({ "PTQ_LUT_AVAILABLE", "1" });
+        }
+        if (ggml_cpu_ptq_lut_enabled()) {
+            features.push_back({ "PTQ_LUT", "1" });
         }
         if (ggml_cpu_has_avx2()) {
             features.push_back({ "AVX2", "1" });
