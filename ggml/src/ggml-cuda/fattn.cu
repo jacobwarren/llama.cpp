@@ -16,6 +16,14 @@ bool ggml_cuda_fa_q8_gqa6_mma_requested() {
     return requested;
 }
 
+bool ggml_cuda_fa_q8_gqa6_mma_q8_query_requested() {
+    static const bool requested = [] {
+        const char * value = std::getenv("GGML_CUDA_FA_Q8_GQA6_MMA_Q8_QUERY");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return requested;
+}
+
 template <int DKQ, int DV, int ncols2, ggml_type type_KV = GGML_TYPE_F16>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -360,6 +368,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_TILE    = 200,
     BEST_FATTN_KERNEL_VEC     = 100,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
+    BEST_FATTN_KERNEL_MMA_Q8_QUERY = 401,
 };
 
 static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
@@ -500,6 +509,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 max_bias == 0.0f && logit_softcap == 0.0f && !dst->src[4] &&
                 ggml_cuda_is_aligned(Q, 16) && ggml_cuda_is_aligned(mask, 16) && ggml_is_contiguous(KQV) &&
                 ggml_cuda_fattn_mma_kv_native_supported(dst) && !ggml_cuda_batch_invariant()) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+            if (ggml_cuda_fa_q8_gqa6_mma_q8_query_requested()) {
+                return BEST_FATTN_KERNEL_MMA_Q8_QUERY;
+            }
+#endif
             return BEST_FATTN_KERNEL_MMA_F16;
         }
     }
@@ -600,6 +614,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     bool need_f16_V = false;
 
     switch (kernel) {
+        case BEST_FATTN_KERNEL_MMA_Q8_QUERY:
         case BEST_FATTN_KERNEL_MMA_F16:
             if (ggml_cuda_fattn_mma_kv_native_supported(dst)) {
                 // In-place quantized K/V kernel: nothing to reserve beyond dst.
@@ -639,6 +654,13 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_MMA_Q8_QUERY:
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+            ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 1, 8, GGML_TYPE_Q8_0, true>(ctx, dst);
+#else
+            GGML_ABORT("Q8 query preparation requires CUDA");
+#endif
             break;
     }
 }

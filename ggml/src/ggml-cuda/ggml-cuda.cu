@@ -6013,6 +6013,7 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     features.push_back({ "PTQ1_0_SOA_WARPS_REQUEST", ggml_cuda_ptq1_0_soa_warps_request() == 2 ? "2" : "4" });
     features.push_back({ "PTQ1_0_SOA_LANES_REQUEST", ggml_cuda_ptq1_0_soa_lanes_request() == 16 ? "16" : "32" });
     features.push_back({ "FA_Q8_GQA6_MMA_REQUEST", ggml_cuda_fa_q8_gqa6_mma_requested() ? "1" : "0" });
+    features.push_back({ "FA_Q8_GQA6_MMA_Q8_QUERY_REQUEST", ggml_cuda_fa_q8_gqa6_mma_q8_query_requested() ? "1" : "0" });
 
     #ifdef GGML_CUDA_FA_ALL_QUANTS
         features.push_back({ "FA_ALL_QUANTS", "1" });
