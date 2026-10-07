@@ -27,6 +27,18 @@ int ggml_cuda_ptq1_0_soa_lanes_request() {
     return requested;
 }
 
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// Private experiment. A request does not establish that an eligible kernel ran.
+static bool ptq1_0_soa_cooperative_request() {
+    static const bool requested = [] {
+        const char * value = std::getenv("GGML_CUDA_PTQ1_0_SOA_COOPERATIVE");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return requested;
+}
+#endif
+
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
@@ -589,6 +601,67 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
     }
     return 1;
 }
+
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// Single-stage, warp-private native PTQ tiles. Host scope is plain N1/K5120/W4/L32.
+// No persistent transformed weights or extra tensor-pool allocation.
+__global__ __launch_bounds__(128, 1)
+void mul_mat_vec_ptq1_0_soa_cooperative(const void * vx_ptr,
+                                     const block_q8_1 * y_ptr,
+                                     float * dst_ptr,
+                                     const uint32_t nrows_x,
+                                     const uint32_t stride_col_y) {
+    // Follow the native PDL/restrict boundary, rather than unconditional pointer qualifiers.
+    const void * GGML_CUDA_RESTRICT vx = vx_ptr;
+    const block_q8_1 * GGML_CUDA_RESTRICT y = y_ptr;
+    float * GGML_CUDA_RESTRICT dst = dst_ptr;
+    constexpr int warps = 4;
+    constexpr int lanes = 32;
+    constexpr int row_blocks = 5120 / QK_PTQ1_0;
+    constexpr int block_words = sizeof(block_ptq1_0) / sizeof(uint32_t);
+    constexpr int tile_words = lanes * block_words;
+    static_assert(sizeof(block_ptq1_0) == 28 && block_words == 7, "native PTQ format");
+    static_assert(warps * tile_words * sizeof(uint32_t) == 3584, "bounded single stage");
+    __shared__ __align__(32) uint32_t packed[warps][tile_words];
+
+    ggml_cuda_pdl_sync();
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const uint32_t row = warps * blockIdx.x + warp;
+    const bool row_ok = row < nrows_x; // uniform for each physical warp
+    float acc = 0.0f;
+
+    if (row_ok) {
+        const uint32_t * row_words = (const uint32_t *) vx + size_t(row) * row_blocks * block_words;
+        for (int base = 0; base < row_blocks; base += lanes) {
+            const int valid_blocks = row_blocks - base < lanes ? row_blocks - base : lanes;
+            const uint32_t * src = row_words + base * block_words;
+#pragma unroll
+            for (int group = 0; group < block_words; ++group) {
+                const int word = group * lanes + lane;
+                if (word < valid_blocks * block_words) {
+                    packed[warp][word] = src[word];
+                }
+            }
+            // All 32 lanes load/publish this warp's tile, including inactive K lanes.
+            __syncwarp();
+            if (lane < valid_blocks) {
+                float dots[1];
+                // Only the weight address changes. Activation kb and helper arithmetic stay native.
+                vec_dot_ptq1_0_q8_1_multi<1>(packed[warp], y, lane, base + lane, stride_col_y, dots);
+                acc += dots[0];
+            }
+            // No lane overwrites the tile while another lane is still decoding it.
+            __syncwarp();
+        }
+    }
+    acc = warp_reduce_sum<32>(acc);
+    if (lane == 0 && row_ok) {
+        dst[row] = acc;
+    }
+}
+#endif
 
 // y_soa: PTQ1_0 one-column activations are in the warp-transposed exact-isum layout (see
 // ggml_cuda_q8_1_layout_for). Only ever instantiated true for type == PTQ1_0 && ncols_dst == 1.
@@ -1406,6 +1479,28 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
                 std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
                                                                       nsamples_dst, warp_size, table_id, c_small_k, c_halve_iters);
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+                if constexpr (type == GGML_TYPE_PTQ1_0 && c_ncols_dst == 1 && c_small_k && !c_halve_iters) {
+                    const bool plain = fusion.gate == nullptr && fusion.x_bias == nullptr && fusion.gate_bias == nullptr &&
+                                       fusion.x_scale == nullptr && fusion.gate_scale == nullptr;
+                    const bool cooperative = ptq1_0_soa_cooperative_request() && y_soa && plain && !has_ids &&
+                        ncols_x == 5120 && nrows_x >= 64 && stride_row_x == blocks_per_row_x && stride_col_dst == nrows_x &&
+                        nchannels_x == 1 && nchannels_y == 1 && nchannels_dst == 1 && nsamples_x == 1 && nsamples_dst == 1 &&
+                        cc == GGML_CUDA_CC_BLACKWELL && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_BLACKWELL &&
+                        warp_size == 32 && dims.second.x == 32 && dims.second.y == 4 && dims.second.z == 1 &&
+                        ggml_cuda_ptq1_0_soa_warps_request() == 4 && ggml_cuda_ptq1_0_soa_lanes_request() == 32 &&
+                        reinterpret_cast<uintptr_t>(vx) % 32 == 0 && reinterpret_cast<uintptr_t>(vy) % 32 == 0 &&
+                        reinterpret_cast<uintptr_t>(dst) % 32 == 0;
+                    if (cooperative) {
+                        const dim3 grid((static_cast<int64_t>(nrows_x) + 3) / 4, 1, 1);
+                        const ggml_cuda_kernel_launch_params launch_params(grid, dim3(32, 4, 1), 0, stream);
+                        ggml_cuda_kernel_launch(mul_mat_vec_ptq1_0_soa_cooperative, launch_params,
+                                               vx, (const block_q8_1 *) vy, dst, uint32_t(nrows_x), uint32_t(stride_col_y));
+                        return;
+                    }
+                }
+#endif
                 bool soa_w2 = false;
                 bool soa_16 = false;
                 if constexpr (type == GGML_TYPE_PTQ1_0 && c_ncols_dst == 1 && c_small_k) {
