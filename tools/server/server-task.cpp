@@ -1780,6 +1780,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
             /*.checkpoints =*/ prompt.checkpoints,
+            /*.retained_user_checkpoint_tokens =*/ prompt.retained_user_checkpoint_tokens,
         },
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),

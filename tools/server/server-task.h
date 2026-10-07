@@ -3,6 +3,7 @@
 #include "common.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <string>
 #include <unordered_set>
 #include <list>
@@ -568,9 +569,66 @@ struct server_prompt {
 
     std::list<common_prompt_checkpoint> checkpoints;
 
+    // Resident prompt metadata only; never part of common/native state serialization.
+    int32_t retained_user_checkpoint_tokens = 0;
+
+    bool is_retained_user_checkpoint(const common_prompt_checkpoint & checkpoint) const {
+        return retained_user_checkpoint_tokens > 0 &&
+               checkpoint.n_tokens == retained_user_checkpoint_tokens && !checkpoint.data_tgt.empty() &&
+               checkpoint.pos_min == checkpoint.pos_max && checkpoint.pos_max == checkpoint.n_tokens - 1;
+    }
+
+    bool has_retained_user_checkpoint() const {
+        return std::any_of(checkpoints.begin(), checkpoints.end(), [&](const auto & checkpoint) {
+            return is_retained_user_checkpoint(checkpoint);
+        });
+    }
+
+    void clear_retained_user_checkpoint() {
+        if (retained_user_checkpoint_tokens > 0) {
+            checkpoints.remove_if([&](const auto & checkpoint) {
+                return checkpoint.n_tokens == retained_user_checkpoint_tokens;
+            });
+            retained_user_checkpoint_tokens = 0;
+        }
+    }
+
+    void invalidate_retained_user_checkpoint(int32_t raw_prefix_tokens) {
+        if (retained_user_checkpoint_tokens > raw_prefix_tokens) {
+            clear_retained_user_checkpoint();
+        }
+    }
+
+    // Call only after the existing serializer completed successfully.
+    bool mark_user_checkpoint(const common_prompt_checkpoint & checkpoint) {
+        if (retained_user_checkpoint_tokens != 0 || checkpoint.n_tokens <= 0 ||
+            checkpoint.n_tokens > n_tokens() || checkpoint.data_tgt.empty() ||
+            checkpoint.pos_min != checkpoint.pos_max ||
+            checkpoint.pos_max != checkpoint.n_tokens - 1) {
+            return false;
+        }
+        if (std::none_of(checkpoints.begin(), checkpoints.end(), [&](const auto & current) {
+                return &current == &checkpoint;
+            })) {
+            return false;
+        }
+        checkpoints.remove_if([&](const auto & current) {
+            return &current != &checkpoint && current.n_tokens == checkpoint.n_tokens;
+        });
+        retained_user_checkpoint_tokens = static_cast<int32_t>(checkpoint.n_tokens);
+        return true;
+    }
+
+    std::list<common_prompt_checkpoint>::iterator oldest_evictable_checkpoint() {
+        return std::find_if(checkpoints.begin(), checkpoints.end(), [&](const auto & checkpoint) {
+            return !is_retained_user_checkpoint(checkpoint);
+        });
+    }
+
     void clear() {
         tokens.clear();
         checkpoints.clear();
+        retained_user_checkpoint_tokens = 0;
     }
 
     int n_tokens() const {
@@ -581,6 +639,7 @@ struct server_prompt {
         return server_prompt {
             tokens.clone(),
             checkpoints,
+            retained_user_checkpoint_tokens,
         };
     }
 };

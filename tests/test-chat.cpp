@@ -8,6 +8,7 @@
 #include "../src/llama-grammar.h"
 #include "../src/unicode.h"
 #include "../tools/server/server-chat.h"
+#include "../tools/server/server-task.h"
 #include "chat-auto-parser.h"
 #include "chat.h"
 #include "common.h"
@@ -7154,7 +7155,72 @@ static void test_msg_diffs_compute() {
     }
 }
 
+static void test_user_checkpoint_retention() {
+    server_prompt prompt;
+    prompt.tokens.insert({11, 12, 13, 14});
+    common_prompt_checkpoint checkpoint;
+    checkpoint.update_pos(2, 1, 1);
+    // Dummy owned bytes exercise metadata policy only, never native state restoration.
+    checkpoint.data_tgt = {1, 2, 3};
+    prompt.checkpoints.push_back(checkpoint);
+
+    auto incomplete = checkpoint;
+    incomplete.data_tgt.clear();
+    assert_equals(true, !prompt.mark_user_checkpoint(incomplete));
+    assert_equals(true, prompt.retained_user_checkpoint_tokens == 0);
+    assert_equals(true, prompt.mark_user_checkpoint(prompt.checkpoints.front()));
+    assert_equals(true, prompt.retained_user_checkpoint_tokens == 2);
+    assert_equals(true, prompt.oldest_evictable_checkpoint() == prompt.checkpoints.end()); // cap1 skips capture
+
+    auto ordinary = checkpoint;
+    ordinary.update_pos(3, 2, 2);
+    prompt.checkpoints.push_back(ordinary);
+    assert_equals(true, prompt.oldest_evictable_checkpoint()->n_tokens == 3);
+    assert_equals(true, !prompt.mark_user_checkpoint(prompt.checkpoints.back())); // never replace the first anchor
+    auto cloned = prompt.clone();
+    assert_equals(true, cloned.retained_user_checkpoint_tokens == 2);
+    assert_equals(true, cloned.checkpoints.front().data_tgt == checkpoint.data_tgt);
+
+    server_prompt_cache cache(1, 32);
+    auto * saved = cache.alloc(prompt, 4, 0);
+    assert_equals(true, saved != nullptr);
+    assert_equals(true, saved->prompt.retained_user_checkpoint_tokens == 2);
+    assert_equals(true, saved->prompt.checkpoints.front().data_tgt == checkpoint.data_tgt);
+
+    server_tokens suffix_edit;
+    suffix_edit.insert({11, 12, 99, 14});
+    cloned.invalidate_retained_user_checkpoint(cloned.tokens.get_common_prefix(suffix_edit));
+    assert_equals(true, cloned.retained_user_checkpoint_tokens == 2);
+    server_tokens header_edit;
+    header_edit.insert({11, 99, 13, 14}); // exactly the last included anchor token changed
+    cloned.invalidate_retained_user_checkpoint(cloned.tokens.get_common_prefix(header_edit));
+    assert_equals(true, cloned.retained_user_checkpoint_tokens == 0);
+    assert_equals(true, cloned.checkpoints.size() == 1 && cloned.checkpoints.front().n_tokens == 3);
+    auto shortened = prompt.clone();
+    shortened.invalidate_retained_user_checkpoint(1);
+    assert_equals(true, shortened.retained_user_checkpoint_tokens == 0);
+    auto missing = prompt.clone();
+    missing.checkpoints.clear();
+    assert_equals(true, !missing.has_retained_user_checkpoint());
+    missing.clear_retained_user_checkpoint();
+    assert_equals(true, missing.retained_user_checkpoint_tokens == 0);
+    auto duplicate = prompt.clone();
+    duplicate.retained_user_checkpoint_tokens = 0;
+    duplicate.checkpoints.push_back(checkpoint);
+    assert_equals(true, duplicate.mark_user_checkpoint(duplicate.checkpoints.back()));
+    assert_equals(true, duplicate.checkpoints.size() == 2);
+    assert_equals(true, std::count_if(duplicate.checkpoints.begin(), duplicate.checkpoints.end(), [&](const auto & current) {
+        return duplicate.is_retained_user_checkpoint(current);
+    }) == 1);
+    prompt.clear();
+    assert_equals(true, prompt.tokens.empty() && prompt.checkpoints.empty() && prompt.retained_user_checkpoint_tokens == 0);
+}
+
 int main(int argc, char ** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--checkpoint-retention") {
+        test_user_checkpoint_retention();
+        return 0;
+    }
     bool detailed_debug    = false;
     bool only_run_filtered = false;
 
@@ -7230,6 +7296,7 @@ int main(int argc, char ** argv) {
         test_msgs_oaicompat_json_conversion();
         test_msg_token_delimiters_split();
         test_tools_oaicompat_json_conversion();
+        test_user_checkpoint_retention();
         test_convert_responses_to_chatcmpl();
         test_developer_role_to_system_workaround();
         test_deepseek_v4_thinking_retention();

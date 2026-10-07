@@ -870,6 +870,7 @@ private:
     int trace = 0;        // env: LLAMA_TRACE
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
+    bool retain_user_checkpoint = false; // cached exact env: GGML_SERVER_RETAIN_USER_CHECKPOINT=1
 
     int n_empty_consecutive = 0;
 
@@ -1294,6 +1295,13 @@ private:
             if (slots_n_diff) {
                 SRV_WRN("LLAMA_SERVER_SLOTS_N_DIFF = %d\n", slots_n_diff);
             }
+        }
+
+        {
+            const char * value = getenv("GGML_SERVER_RETAIN_USER_CHECKPOINT");
+            retain_user_checkpoint = value != nullptr && std::string(value) == "1";
+            SRV_INF("retained user checkpoint requested = %s (supported tasks only)\n",
+                    retain_user_checkpoint ? "true" : "false");
         }
 
         // the update_slots() logic will always submit a maximum of n_batch or n_parallel tokens
@@ -2244,14 +2252,48 @@ private:
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
-    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+    bool can_retain_user_checkpoint(const server_slot & slot) const {
+        const auto only_none = [](const auto & types) {
+            return std::all_of(types.begin(), types.end(), [](auto type) {
+                return type == COMMON_SPECULATIVE_TYPE_NONE;
+            });
+        };
+        return retain_user_checkpoint && params_base.n_ctx_checkpoints > 0 && params_base.n_parallel == 1 &&
+               slots.size() == 1 && llama_n_seq_max(ctx_tgt) == 1 &&
+               slot.task && slot.task->type == SERVER_TASK_TYPE_COMPLETION &&
+               !slot.task->is_parent() && !slot.task->is_child() &&
+               slot.task->params.cache_prompt && slot.task->params.n_cache_reuse == 0 &&
+               (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) &&
+               llama_model_n_swa(model_tgt) == 0 && !params_base.ctx_shift &&
+               params_base.grp_attn_n == 1 && params_base.control_vectors.empty() &&
+               params_base.mmproj.path.empty() && mctx == nullptr &&
+               !slot.task->tokens.has_mtmd && !slot.prompt.tokens.has_mtmd &&
+               model_dft == nullptr && ctx_dft == nullptr &&
+               only_none(params_base.speculative.types) && only_none(slot.task->params.speculative.types) &&
+               common_speculative_get_types(spec.get()).empty() &&
+               params_base.lora_adapters.empty() && slot.lora.empty() && slot.task->params.lora.empty();
+    }
+
+    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max,
+                           bool is_last_user = false) {
         const int id_task = slot.task->id;
+
+        if (slot.prompt.retained_user_checkpoint_tokens > 0 && !slot.prompt.has_retained_user_checkpoint()) {
+            slot.prompt.clear_retained_user_checkpoint();
+        }
+        if (slot.prompt.has_retained_user_checkpoint() &&
+            slot.prompt.retained_user_checkpoint_tokens == slot.prompt.n_tokens() - n_tokens_cur) {
+            SLT_TRC(slot, "%s", "retained user checkpoint already exists; skipping duplicate capture\n");
+            return;
+        }
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         int64_t last = -1;
         for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
-            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
+            if (!slot.prompt.is_retained_user_checkpoint(*it) &&
+                it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
@@ -2265,32 +2307,51 @@ private:
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
+            const auto it = slot.prompt.oldest_evictable_checkpoint();
+            if (it == slot.prompt.checkpoints.end()) {
+                SLT_TRC(slot, "%s", "checkpoint cap contains only retained user state; skipping ordinary capture\n");
+                return;
+            }
+            const auto & cur = *it;
 
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+            slot.prompt.checkpoints.erase(it);
         }
 
-        auto & cur = slot.prompt.checkpoints.emplace_back();
+        try {
+            auto & cur = slot.prompt.checkpoints.emplace_back();
 
-        cur.id_task = id_task;
+            cur.id_task = id_task;
 
-        // [TAG_CHECKPOINTS_FIX_POS_MIN]
-        // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
-        //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
-        cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
+            // [TAG_CHECKPOINTS_FIX_POS_MIN]
+            // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
+            //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
+            cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        // stash the draft's speculative state with the checkpoint
-        common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+            cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            // stash the draft's speculative state with the checkpoint
+            common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
-        SLT_TRC(slot,
-                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
-                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+            if (is_last_user && can_retain_user_checkpoint(slot) && slot.prompt.mark_user_checkpoint(cur)) {
+                SLT_TRC(slot, "retained last-user checkpoint (n_tokens = %d)\n",
+                        slot.prompt.retained_user_checkpoint_tokens);
+            }
+
+            SLT_TRC(slot,
+                    "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                    (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
+                    cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+        } catch (...) {
+            if (retain_user_checkpoint) {
+                // Prompt tokens include the not-yet-decoded batch. Never cache this partial state.
+                slot.prompt_clear();
+            }
+            throw;
+        }
+
     }
 
     // returns false to decline the task, it is offered again after the decode is done
@@ -3082,6 +3143,11 @@ private:
                             }
                         }*/
 
+                        if (retain_user_checkpoint && !can_retain_user_checkpoint(slot)) {
+                            SLT_TRC(slot, "%s", "user-checkpoint retention unsupported for task; clearing cached prompt\n");
+                            slot.prompt_clear();
+                        }
+
                         // keep track how many tokens we can reuse from the previous state
                         int n_past = 0;
 
@@ -3139,6 +3205,8 @@ private:
                             if (slot.task->params.cache_prompt) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+                                // Raw token equality must precede all recurrent/logits/chunk-reuse clamps.
+                                slot.prompt.invalidate_retained_user_checkpoint(n_past);
 
                                 // if there is an alora invoked, don't cache after the invocation start
                                 if (slot.alora_invocation_start > 0) {
@@ -3313,6 +3381,9 @@ private:
                                     const auto & cur = *it;
                                     if (cur.pos_max > pos_next) {
                                         SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
+                                        if (slot.prompt.is_retained_user_checkpoint(cur)) {
+                                            slot.prompt.retained_user_checkpoint_tokens = 0;
+                                        }
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {
                                         ++it;
@@ -3553,7 +3624,7 @@ private:
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
-                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max, is_last_user_message);
                     }
                 }
 
