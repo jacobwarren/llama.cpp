@@ -4073,6 +4073,19 @@ class tinyBLAS_PTQ1_AVX {
         const __m256i dot = _mm256_sub_epi32(ptq1_0_dot_u8(code, qy), sy);
         return _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot), _mm256_set1_ps(scale), acc);
     }
+#if defined(_MSC_VER)
+    static __forceinline
+#elif defined(__GNUC__)
+    static __attribute__((always_inline)) inline
+#else
+    static inline
+#endif
+    __m256 madd1x4(__m256 acc, __m256i code, const block_q8_0 * y, ggml_half dx) {
+        const __m256i qy = _mm256_loadu_si256((const __m256i *) y->qs);
+        const __m256i dot = ptq1_0_dot(code, qy);
+        const float scale = unhalf(dx) * unhalf(y->d);
+        return _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot), _mm256_set1_ps(scale), acc);
+    }
     NOINLINE void gemm1x4(int64_t m, int64_t n) {
         const int64_t xtiles = n / 4;
         const int64_t tiles = xtiles * m;
@@ -4088,33 +4101,16 @@ class tinyBLAS_PTQ1_AVX {
             __m256 acc3 = _mm256_setzero_ps();
             for (int64_t l = 0; l < k; ++l) {
                 const block_ptq1_0 * x = &A[lda * ii + l];
-                const float da = unhalf(x->d);
                 const block_q8_0 * b0 = &B[ldb * jj + 4 * l];
                 const block_q8_0 * b1 = &B[ldb * (jj + 1) + 4 * l];
                 const block_q8_0 * b2 = &B[ldb * (jj + 2) + 4 * l];
                 const block_q8_0 * b3 = &B[ldb * (jj + 3) + 4 * l];
                 for (int group = 0; group < 4; ++group) {
                     const __m256i code = ptq1_0_unpack_32(x, group);
-                    {
-                        const __m256i qy = _mm256_loadu_si256((const __m256i *) b0[group].qs);
-                        const __m256i sy = ptq1_0_dot_u8(_mm256_set1_epi8(1), qy);
-                        acc0 = madd(acc0, code, qy, sy, da * unhalf(b0[group].d));
-                    }
-                    {
-                        const __m256i qy = _mm256_loadu_si256((const __m256i *) b1[group].qs);
-                        const __m256i sy = ptq1_0_dot_u8(_mm256_set1_epi8(1), qy);
-                        acc1 = madd(acc1, code, qy, sy, da * unhalf(b1[group].d));
-                    }
-                    {
-                        const __m256i qy = _mm256_loadu_si256((const __m256i *) b2[group].qs);
-                        const __m256i sy = ptq1_0_dot_u8(_mm256_set1_epi8(1), qy);
-                        acc2 = madd(acc2, code, qy, sy, da * unhalf(b2[group].d));
-                    }
-                    {
-                        const __m256i qy = _mm256_loadu_si256((const __m256i *) b3[group].qs);
-                        const __m256i sy = ptq1_0_dot_u8(_mm256_set1_epi8(1), qy);
-                        acc3 = madd(acc3, code, qy, sy, da * unhalf(b3[group].d));
-                    }
+                    acc0 = madd1x4(acc0, code, &b0[group], x->d);
+                    acc1 = madd1x4(acc1, code, &b1[group], x->d);
+                    acc2 = madd1x4(acc2, code, &b2[group], x->d);
+                    acc3 = madd1x4(acc3, code, &b3[group], x->d);
                 }
             }
             C[ldc * jj + ii] = pq2_hsum(acc0);

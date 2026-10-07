@@ -1,6 +1,6 @@
 # PTQ 1-row by 4-token research tile
 
-This isolated source-only slice starts at
+This isolated research slice starts at
 `9f719f13ba715e32ebce425d9323e05aa390fc39`, the retained opt-in 2x2 compact
 PTQ experiment. It does not change the integrated dot pin, profiling fork,
 prefix-cache fork, original llama.cpp checkout or model format.
@@ -53,7 +53,7 @@ variant, new ISA dispatch, persistent weight expansion or lookup tables are
 introduced. Fewer decoded rows do not establish fewer compiler spills or a
 speedup; assembly and paired measurements are required.
 
-## Pending validation
+## Validation plan
 
 The existing `test-backend-ops` matrix grid now covers M=1/2/3/5 and
 N=1/2/3/4/5/6/7/8/9/10/11/12/15/16/17 at short K. Actual Bonsai widths
@@ -96,5 +96,48 @@ Inspect generated `gemm1x4` assembly for inlined group decode, accumulator spill
 frame size and register saves before model timing. The root task then owns
 serial reversed-order controls for prefill/verification N=1/2/4/8/16, whole-model
 quality and cancellation, process memory and throughput. MSVC/Clang and target
-Intel/AMD behavior are separate acceptance work. No native build, execution,
-model hashing or performance measurement has occurred in this source-only slice.
+Intel/AMD behavior are separate acceptance work. The first schedule's native
+codegen/numerical checks are recorded below. No model hashing or performance
+measurement has occurred in this slice.
+
+## Retained first schedule and source-only second schedule
+
+The first schedule is committed at
+`8227ece66ca7b7cf6eff684a8c2d69361ff5f168`. The matched MSVC Release
+AVX2 + AVX_VNNI build passes quantization with zero failures and all 473 matrix
+cases at zero allowed CPU NMSE in compact-unset/0 ignore controls, compact
+default, explicit 2x2 and 1x4 modes. Each mode executes all 30 direct-byte cases.
+The observer initially missed ANSI-colored `OK` text; its corrected parse
+confirms the native run passed. This is retained alongside the original observer
+failure and exact commands under the sibling Rig artifacts directory
+`artifacts/bonsai-cpu/20261006/act-tile-validation/`.
+
+Same-object disassembly shows both tiles still spill all four accumulators
+inside group updates and reserve a 0x1c0 stack frame. The 1x4 function has 310
+static instructions and a 105-instruction group region, versus 345 and 147 for
+2x2. These counts include alternative branch paths, not retired instructions.
+The 2x2 group also spills/reloads a decoded weight vector; 1x4 does not. The
+listed vector stack traffic is 1024 versus 1280 bytes per 128-K step for a
+four-output tile, excluding ABI saves and scalar traffic. The accumulator
+register-residency goal remains unmet; throughput still requires paired controls.
+The first source, object, CPU DLL, disassembly and SHA-256 manifest are preserved
+in `stage1-source/` before any further edits.
+
+The second schedule puts Q8 load, the existing centered integer-dot
+helper and both FP16 scale conversions inside a forced-inline, by-value return
+helper. Weight scale stays in its original half representation at the call
+site; source scratch is local to one activation column after code unpack.
+The original 2x2 helper, scale/update order, format and ISA dispatch remain
+unchanged. The matched MSVC build passes all 473 cases, including the 30
+direct-byte fixtures, in the same five selector modes at zero allowed CPU NMSE.
+Its 1x4 function has 308 static instructions and a 106-instruction group region,
+still a 0x1c0 frame and all four hot accumulator spills. Group vector stack
+traffic remains 1024 bytes per 128-K step per four-output tile. The decoder and
+centered-dot helper inline; the only call is the cold invalid-group abort.
+Same-object 2x2 disassembly is identical to the first schedule.
+
+The second source/patch, object, CPU DLL, disassembly, exact test commands and
+SHA-256 provenance are retained separately. Neither schedule establishes
+register-resident accumulation or a performance improvement. Fewer decoder
+instructions/spill bytes can still justify controlled throughput measurements;
+they do not determine throughput on this host or other targets.
