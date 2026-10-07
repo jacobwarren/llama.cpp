@@ -7168,7 +7168,7 @@ static void test_responses_reasoning_content_index() {
     assert_equals(std::string("response.output_item.added"), first.at(0).at("event").get<std::string>());
     assert_equals(partial.oai_resp_reasoning_id, first.at(0).at("data").at("item").at("id").get<std::string>());
     assert_equals(std::string("reasoning"), first.at(0).at("data").at("item").at("type").get<std::string>());
-    assert_equals(json({{"type", "response.reasoning_text.delta"}, {"delta", "fixture-first"}, {"item_id", "rs_fixture"}, {"content_index", 0}}), first.at(1).at("data"));
+    assert_equals(json({{"type", "response.reasoning_text.delta"}, {"delta", "fixture-first"}, {"item_id", "rs_fixture"}, {"content_index", 0}}).dump(), first.at(1).at("data").dump());
     assert_equals(true, first.at(1).at("data").at("content_index").is_number_integer());
     assert_equals(true, partial.thinking_block_started);
 
@@ -7176,7 +7176,7 @@ static void test_responses_reasoning_content_index() {
     partial.oaicompat_msg_diffs   = {diff};
     const json next = partial.to_json_oaicompat_resp();
     assert_equals(size_t(1), next.size());
-    assert_equals(json({{"type", "response.reasoning_text.delta"}, {"delta", "fixture-next"}, {"item_id", "rs_fixture"}, {"content_index", 0}}), next.at(0).at("data"));
+    assert_equals(json({{"type", "response.reasoning_text.delta"}, {"delta", "fixture-next"}, {"item_id", "rs_fixture"}, {"content_index", 0}}).dump(), next.at(0).at("data").dump());
     assert_equals(true, next.at(0).at("data").at("content_index").is_number_integer());
 
     server_task_result_cmpl_final final{};
@@ -7201,7 +7201,7 @@ static void test_responses_reasoning_content_index() {
     assert_equals(std::string("response.output_item.added"), text.at(0).at("event").get<std::string>());
     assert_equals(std::string("message"), text.at(0).at("data").at("item").at("type").get<std::string>());
     assert_equals(std::string("response.content_part.added"), text.at(1).at("event").get<std::string>());
-    assert_equals(json({{"type", "response.output_text.delta"}, {"item_id", "msg_fixture"}, {"delta", "fixture-output"}}), text.at(2).at("data"));
+    assert_equals(json({{"type", "response.output_text.delta"}, {"item_id", "msg_fixture"}, {"delta", "fixture-output"}}).dump(), text.at(2).at("data").dump());
     assert_equals(false, text_only.thinking_block_started);
 }
 
