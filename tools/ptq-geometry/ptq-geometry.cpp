@@ -131,7 +131,7 @@ int main(int argc, char ** argv) {
         for (int node = 0; node < ggml_graph_n_nodes(gf); ++node) {
             GGML_ASSERT(ggml_backend_supports_op(backend, ggml_graph_node(gf, node)));
         }
-        for (int repetition = 0; repetition < 2; ++repetition) {
+        for (int repetition = 0; repetition < 3; ++repetition) {
             GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
             std::vector<float> values(ggml_nelements(out));
             ggml_backend_tensor_get(out, values.data(), 0, values.size() * sizeof(values[0]));

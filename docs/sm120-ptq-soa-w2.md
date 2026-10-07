@@ -34,7 +34,7 @@ no code/framework or SM100 TCGEN05 instruction is imported.
 with CUDA and static backend registration. It creates the output exclusively
 and refuses existing files. Fresh stock/W2 processes generate identical
 seeded PTQ bytes/nontrivial FP16 scales and F32 inputs; CUDA0 executes101 cases
-twice, capturing initial compute and graph reuse. Device support and finite
+three times: direct warmup, graph capture/launch, then stable graph reuse. Device support and finite
 outputs are required. Output is a binary header followed by per-case headers
 and float arrays; byte equality is a separate gate from CPU-reference tolerance.
 
@@ -50,7 +50,7 @@ cannot prove the candidate launched.
 Header uint32 values are magic0x50545147, version1 and case count. Each record
 has six uint32 values: case index, repetition, M,N,K,kind, followed by M*N
 float32 bytes. Kinds0..5 are ordinary, bias, SwiGLU, GeGLU, signed FWHT and
-padded row. A successful file contains202 records; there are no model/prompt
+padded row. A successful file contains303 records; there are no model/prompt
 contents. Native output and artifact comparison are owned by the validation
 lease. Compile flags, source/binary/dependency identities, failures, snapshots,
 bitwise comparison, GPU tolerances and launch/codegen proof must be retained.
