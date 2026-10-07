@@ -7396,9 +7396,10 @@ struct test_flash_attn_ext_gqa6_mma : public test_flash_attn_ext {
     int shifted_src = -1;
     int masked_tail = 17;
     ggml_tensor * output = nullptr;
+    const uint32_t input_seed = 0x6a09e667u;
 
     std::string vars() override {
-        return test_flash_attn_ext::vars() + ",gqa6_mma=1," + VARS_TO_STR2(shifted_src, masked_tail);
+        return test_flash_attn_ext::vars() + ",gqa6_mma=1," + VARS_TO_STR3(shifted_src, masked_tail, input_seed);
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -7417,8 +7418,36 @@ struct test_flash_attn_ext_gqa6_mma : public test_flash_attn_ext {
         return output;
     }
 
+    double err(const float * a, const float * b, size_t n) override {
+        const double value = test_flash_attn_ext::err(a, b, n);
+        if (output && n == size_t(ggml_nelements(output))) {
+            fprintf(stderr, "GQA6_FA_NMSE elements=%zu value=%.17g limit=%.17g params=%s\n", n, value, max_nmse_err(), vars().c_str());
+        }
+        return value;
+    }
+
     void initialize_tensors(ggml_context * ctx) override {
-        test_flash_attn_ext::initialize_tensors(ctx);
+        uint32_t ordinal = 0;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            uint32_t state = input_seed + 0x9e3779b9u*ordinal++;
+            const size_t n = ggml_nelements(t);
+            std::vector<float> data(n);
+            for (size_t i = 0; i < n; ++i) {
+                state = 1664525u*state + 1013904223u;
+                data[i] = float(int32_t(state >> 8) - 8388608)*0x1p-23f;
+                if (strcmp(t->name, "s") == 0) {
+                    data[i] *= 10.0f;
+                }
+            }
+            if (t->type == GGML_TYPE_F32) {
+                ggml_backend_tensor_set(t, data.data(), 0, n*sizeof(float));
+            } else {
+                GGML_ASSERT(t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_Q4_0 || t->type == GGML_TYPE_Q8_0);
+                std::vector<uint8_t> packed(ggml_row_size(t->type, n));
+                ggml_quantize_chunk(t->type, data.data(), packed.data(), 0, ggml_nrows(t), t->ne[0], nullptr);
+                ggml_backend_tensor_set(t, packed.data(), 0, packed.size());
+            }
+        }
         ggml_tensor * m = output->src[3];
         if (!m) {
             return;
