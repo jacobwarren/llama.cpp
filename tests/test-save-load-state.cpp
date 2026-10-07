@@ -4,8 +4,255 @@
 #include "llama-cpp.h"
 
 #include <clocale>
+#include <cstdio>
 #include <random>
 #include <vector>
+
+#ifdef LLAMA_TEST_CHECKPOINT_BUNDLE
+#include "../tools/server/server-checkpoint-bundle.h"
+
+#include <array>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <stdexcept>
+
+static int test_checkpoint_bundle_envelope() {
+    namespace fs = std::filesystem;
+    const auto directory = fs::temp_directory_path() / ("llama-checkpoint-test-" + std::to_string(ggml_time_us()) + ".bundle");
+    if (!fs::create_directory(directory)) {
+        return 1;
+    }
+    struct cleanup_directory {
+        fs::path path;
+        ~cleanup_directory() { std::error_code error; fs::remove_all(path, error); }
+    } cleanup{directory};
+
+    const server_tokens tokens(llama_tokens{1, 2, 3, 4}, false);
+    const auto packed = tokens.serialize();
+    std::vector<char> endpoint;
+    std::vector<char> checkpoint;
+    const auto append = [](std::vector<char> & bytes, auto value) {
+        const auto * data = reinterpret_cast<const char *>(&value);
+        bytes.insert(bytes.end(), data, data + sizeof(value));
+    };
+    const auto row = [&](std::vector<char> & bytes, ggml_type type, uint64_t row_bytes, size_t cells) {
+        append(bytes, static_cast<int32_t>(type));
+        append(bytes, row_bytes);
+        bytes.insert(bytes.end(), row_bytes * cells, 0);
+    };
+    const auto recurrent = [&](std::vector<char> & bytes, llama_pos pos) {
+        append(bytes, uint32_t{1});
+        append(bytes, pos);
+        append(bytes, uint32_t{0});
+        append(bytes, uint32_t{0});
+        append(bytes, uint32_t{2});
+        row(bytes, GGML_TYPE_F32, 4, 1);
+        row(bytes, GGML_TYPE_F32, 4, 1);
+    };
+    append(endpoint, uint32_t{LLAMA_STATE_SEQ_MAGIC});
+    append(endpoint, uint32_t{LLAMA_STATE_SEQ_VERSION});
+    append(endpoint, static_cast<uint32_t>(packed.size() / sizeof(llama_token)));
+    endpoint.insert(endpoint.end(), packed.begin(), packed.end());
+    append(endpoint, uint32_t{1});
+    const auto cell_count_offset = endpoint.size();
+    append(endpoint, uint32_t{4});
+    for (llama_pos pos = 0; pos < 4; ++pos) {
+        append(endpoint, pos);
+        append(endpoint, uint32_t{1});
+        append(endpoint, pos);
+        append(endpoint, pos);
+        append(endpoint, llama_seq_id{0});
+    }
+    append(endpoint, uint32_t{0});
+    append(endpoint, uint32_t{1});
+    const auto attention_row_offset = endpoint.size() + sizeof(int32_t);
+    row(endpoint, GGML_TYPE_Q8_0, 34, 4);
+    row(endpoint, GGML_TYPE_Q8_0, 34, 4);
+    const auto recurrent_offset = endpoint.size();
+    recurrent(endpoint, 3);
+    append(checkpoint, uint32_t{0xaf143cd8});
+    append(checkpoint, llama_seq_id{0});
+    recurrent(checkpoint, 1);
+
+    const json shape = {
+        {"n_stream", 1}, {"pos_per_embd", 4}, {"v_trans", false},
+        {"attention_keys", {{{"type", GGML_TYPE_Q8_0}, {"row_bytes", 34}}}},
+        {"attention_values", {{{"type", GGML_TYPE_Q8_0}, {"row_bytes", 34}}}},
+        {"recurrent_layers", 2},
+        {"recurrent_r", {{{"type", GGML_TYPE_F32}, {"row_bytes", 4}}}},
+        {"recurrent_s", {{{"type", GGML_TYPE_F32}, {"row_bytes", 4}}}},
+    };
+    const json identity = {
+        {"model_sha256", std::string(64, 'a')}, {"engine", {{"commit", "test"}}},
+        {"layout", {{"n_ctx_slot", 128}, {"model_layers", 2}, {"native_state", shape}}},
+    };
+    const auto write = [](const fs::path & path, const void * data, size_t size) {
+        std::ofstream output(path, std::ios::binary | std::ios::trunc);
+        output.write(static_cast<const char *>(data), static_cast<std::streamsize>(size));
+        output.close();
+        if (output.fail()) {
+            throw std::runtime_error("Unable to write envelope test fixture");
+        }
+    };
+    json manifest;
+    const auto write_manifest = [&]() {
+        const auto text = manifest.dump();
+        write(directory / "manifest.json", text.data(), text.size());
+    };
+    const auto refresh_payload = [&](const char * file, const std::vector<char> & bytes, json & info) {
+        write(directory / file, bytes.data(), bytes.size());
+        info = {{"bytes", bytes.size()}, {"sha256", server_checkpoint_bundle_hash_file((directory / file).string(), SERVER_CHECKPOINT_BUNDLE_MAX_BYTES)}};
+    };
+    const auto reset = [&]() {
+        manifest = {
+            {"format", "rig-checkpoint-bundle"}, {"version", 1}, {"identity", identity},
+            {"source_slot", 0}, {"token_ids", {1, 2, 3, 4}},
+            {"checkpoint", {{"n_tokens", 2}, {"pos_min", 1}, {"pos_max", 1}, {"flags", LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY}}},
+        };
+        refresh_payload("endpoint.ggsq", endpoint, manifest["endpoint"]);
+        refresh_payload("checkpoint.bin", checkpoint, manifest["checkpoint"]["payload"]);
+        write_manifest();
+    };
+    const auto rejected = [&](const char * label, const json & expected) {
+        try {
+            server_checkpoint_bundle_read(directory.string(), expected);
+        } catch (const std::exception &) {
+            return;
+        }
+        throw std::runtime_error(std::string("Accepted invalid envelope: ") + label);
+    };
+    try {
+        reset();
+        {
+            const auto valid = server_checkpoint_bundle_read(directory.string(), identity);
+            if (valid.tokens.get_tokens() != tokens.get_tokens() || valid.checkpoint.n_tokens != 2 || valid.checkpoint.id_task != -1) {
+                throw std::runtime_error("Valid checkpoint envelope changed its boundary");
+            }
+            std::ofstream changed(directory / "endpoint.ggsq", std::ios::binary | std::ios::trunc);
+#if defined(_WIN32)
+            if (!changed.fail()) {
+                throw std::runtime_error("Validated Windows endpoint permitted a writer");
+            }
+#else
+            changed << "changed";
+            changed.close();
+            if (changed.fail()) {
+                throw std::runtime_error("Unable to replace POSIX source fixture");
+            }
+#endif
+            std::vector<char> retained(endpoint.size());
+            if (std::fread(retained.data(), 1, retained.size(), valid.endpoint_file.get()) != retained.size() || retained != endpoint) {
+                throw std::runtime_error("Validated endpoint bytes changed before load");
+            }
+        }
+        reset();
+
+        auto split_identity = identity;
+        split_identity["layout"]["native_state"]["n_stream"] = 2;
+        auto split_endpoint = endpoint;
+        const uint32_t two_streams = 2;
+        std::memcpy(split_endpoint.data() + sizeof(uint32_t) * 3 + packed.size(), &two_streams, sizeof(two_streams));
+        split_endpoint.insert(split_endpoint.begin() + recurrent_offset, sizeof(uint32_t), 0);
+        manifest["identity"] = split_identity;
+        refresh_payload("endpoint.ggsq", split_endpoint, manifest["endpoint"]);
+        write_manifest();
+        {
+            const auto valid = server_checkpoint_bundle_read(directory.string(), split_identity);
+            if (valid.tokens.size() != 4) {
+                throw std::runtime_error("Non-unified stream envelope failed");
+            }
+        }
+        const uint32_t wrong_stream_count = 1;
+        std::memcpy(split_endpoint.data() + recurrent_offset, &wrong_stream_count, sizeof(wrong_stream_count));
+        refresh_payload("endpoint.ggsq", split_endpoint, manifest["endpoint"]);
+        write_manifest();
+        rejected("unexpected populated stream", split_identity);
+        reset();
+
+        manifest["version"] = 2;
+        write_manifest();
+        rejected("version", identity);
+        reset();
+        auto incompatible = identity;
+        incompatible["model_sha256"] = std::string(64, 'b');
+        rejected("model", incompatible);
+        incompatible = identity;
+        incompatible["engine"]["commit"] = "other";
+        rejected("engine", incompatible);
+        incompatible = identity;
+        incompatible["layout"]["n_ctx_slot"] = 127;
+        rejected("layout", incompatible);
+
+        manifest["checkpoint"]["payload"]["bytes"] = SERVER_CHECKPOINT_BUNDLE_MAX_CHECKPOINT_BYTES + 1;
+        write_manifest();
+        rejected("checkpoint byte admission", identity);
+        reset();
+        fs::resize_file(directory / "manifest.json", 512 * 1024 + 1);
+        rejected("manifest byte admission", identity);
+        reset();
+
+        auto damaged = checkpoint;
+        damaged.back() ^= 1;
+        write(directory / "checkpoint.bin", damaged.data(), damaged.size());
+        rejected("checksum", identity);
+        reset();
+        damaged.pop_back();
+        refresh_payload("checkpoint.bin", damaged, manifest["checkpoint"]["payload"]);
+        write_manifest();
+        rejected("truncated tensor with recomputed checksum", identity);
+        reset();
+
+        damaged = endpoint;
+        const uint32_t huge_count = UINT32_MAX;
+        std::memcpy(damaged.data() + cell_count_offset, &huge_count, sizeof(huge_count));
+        refresh_payload("endpoint.ggsq", damaged, manifest["endpoint"]);
+        write_manifest();
+        rejected("native allocation count with recomputed checksum", identity);
+        reset();
+        damaged = endpoint;
+        const uint64_t wrong_row = 35;
+        std::memcpy(damaged.data() + attention_row_offset, &wrong_row, sizeof(wrong_row));
+        refresh_payload("endpoint.ggsq", damaged, manifest["endpoint"]);
+        write_manifest();
+        rejected("native row layout with recomputed checksum", identity);
+        reset();
+        damaged = endpoint;
+        damaged.push_back(0);
+        refresh_payload("endpoint.ggsq", damaged, manifest["endpoint"]);
+        write_manifest();
+        rejected("native trailing data with recomputed checksum", identity);
+        reset();
+
+        manifest["token_ids"][0] = 8;
+        write_manifest();
+        rejected("token manifest", identity);
+        reset();
+        manifest["checkpoint"]["n_tokens"] = -1;
+        write_manifest();
+        rejected("negative checkpoint boundary", identity);
+        reset();
+        manifest["checkpoint"]["pos_min"] = 0;
+        write_manifest();
+        rejected("checkpoint rollback boundary", identity);
+        reset();
+        damaged = checkpoint;
+        const llama_pos wrong_pos = 3;
+        std::memcpy(damaged.data() + 12, &wrong_pos, sizeof(wrong_pos));
+        refresh_payload("checkpoint.bin", damaged, manifest["checkpoint"]["payload"]);
+        write_manifest();
+        rejected("checkpoint position with recomputed checksum", identity);
+        reset();
+        fs::remove(directory / "manifest.json");
+        rejected("unpublished generation", identity);
+        LOG("Checkpoint bundle envelope tests passed.\n");
+        return 0;
+    } catch (const std::exception & error) {
+        LOG_ERR("Checkpoint bundle envelope test failed: %s\n", error.what());
+        return 1;
+    }
+}
+#endif
 
 struct llama_batch_ptr {
     llama_batch batch;
@@ -248,6 +495,34 @@ static bool test_seq_cp_host(struct llama_model * model, const struct common_par
         }
         LOG_TRC("%s: seq 0 copied, %zd bytes\n", __func__, ncopy);
 
+        // The borrowed file API must preserve the state and leave the caller's handle open.
+        const auto sequence_path = params.out_file + ".seq_handle";
+        struct cleanup_sequence_file {
+            std::string path;
+            ~cleanup_sequence_file() { std::remove(path.c_str()); }
+        } sequence_cleanup{sequence_path};
+        const auto saved_bytes = llama_state_seq_save_file(ctx.get(), sequence_path.c_str(), 0, tokens.data(), tokens.size());
+        std::unique_ptr<FILE, decltype(&std::fclose)> source(ggml_fopen(sequence_path.c_str(), "rb"), std::fclose);
+        size_t restored_count = 0;
+        if (!source || saved_bytes == 0 ||
+                llama_state_seq_load_file_handle(ctx.get(), source.get(), 0, nullptr, 0, &restored_count) != 12 ||
+                restored_count != tokens.size()) {
+            LOG_ERR("%s: borrowed sequence token query failed\n", __func__);
+            return false;
+        }
+        llama_memory_clear(llama_get_memory(ctx.get()), true);
+        llama_tokens restored_tokens(tokens.size());
+        if (llama_state_seq_load_file_handle(ctx.get(), source.get(), 0, restored_tokens.data(), restored_tokens.size(), &restored_count) != saved_bytes ||
+                restored_tokens != tokens || std::fseek(source.get(), 0, SEEK_SET) != 0 || std::fgetc(source.get()) == EOF) {
+            LOG_ERR("%s: borrowed sequence restore failed or closed its file\n", __func__);
+            return false;
+        }
+        std::vector<uint8_t> restored_state(seq_store.size());
+        if (llama_state_seq_get_data(ctx.get(), restored_state.data(), restored_state.size(), 0) != seq_store.size() || restored_state != seq_store) {
+            LOG_ERR("%s: borrowed sequence state differs\n", __func__);
+            return false;
+        }
+
         llama_memory_clear(llama_get_memory(ctx.get()), true);
         LOG_TRC("%s: kv cache cleared\n", __func__);
 
@@ -348,6 +623,11 @@ static bool test_seq_cp_device(struct llama_model * model, const struct common_p
 
 
 int main(int argc, char ** argv) {
+#ifdef LLAMA_TEST_CHECKPOINT_BUNDLE
+    if (argc == 2 && std::string(argv[1]) == "--checkpoint-bundle-only") {
+        return test_checkpoint_bundle_envelope();
+    }
+#endif
     std::setlocale(LC_NUMERIC, "C");
 
     common_params params;

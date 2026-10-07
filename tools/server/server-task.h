@@ -166,6 +166,7 @@ struct server_task {
         int id_slot;
         std::string filename;
         std::string filepath;
+        bool checkpoint_bundle = false;
     };
     slot_action slot_action;
 
@@ -525,6 +526,8 @@ struct server_task_result_slot_save_load : server_task_result {
     size_t n_tokens;
     size_t n_bytes;
     double t_ms;
+    bool checkpoint_bundle = false;
+    int64_t checkpoint_tokens = 0;
 
     virtual json to_json() override;
 };

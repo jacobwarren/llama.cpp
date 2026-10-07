@@ -1620,6 +1620,14 @@ std::string server_task_result_metrics::to_metrics() {
 // server_task_result_slot_save_load
 //
 json server_task_result_slot_save_load::to_json() {
+    if (checkpoint_bundle) {
+        return json {
+            { "id_slot", id_slot }, { "filename", filename }, { "checkpoint_bundle", true },
+            { is_save ? "n_saved" : "n_restored", n_tokens }, { is_save ? "n_written" : "n_read", n_bytes },
+            { "checkpoint_tokens", checkpoint_tokens },
+            { "timings", {{ is_save ? "save_ms" : "restore_ms", t_ms }} },
+        };
+    }
     if (is_save) {
         return json {
             { "id_slot",   id_slot },

@@ -3386,6 +3386,15 @@ bool llama_context::state_save_file(const char * filepath, const llama_token * t
 
 size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
     llama_file file(filepath, "rb");
+    return state_seq_load_file_impl(seq_id, file, tokens_out, n_token_capacity, n_token_count_out);
+}
+
+size_t llama_context::state_seq_load_file(llama_seq_id seq_id, FILE * source, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+    llama_file file(source);
+    return state_seq_load_file_impl(seq_id, file, tokens_out, n_token_capacity, n_token_count_out);
+}
+
+size_t llama_context::state_seq_load_file_impl(llama_seq_id seq_id, llama_file & file, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
 
     // version checks
     {
@@ -4439,6 +4448,20 @@ size_t llama_state_seq_load_file(llama_context * ctx, const char * filepath, lla
         return ctx->state_seq_load_file(dest_seq_id, filepath, tokens_out, n_token_capacity, n_token_count_out);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading sequence state file: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_state_seq_load_file_handle(llama_context * ctx, FILE * file, llama_seq_id dest_seq_id, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+    if (ctx == nullptr || file == nullptr || n_token_count_out == nullptr) {
+        return 0;
+    }
+    ctx->synchronize();
+
+    try {
+        return ctx->state_seq_load_file(dest_seq_id, file, tokens_out, n_token_capacity, n_token_count_out);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error loading sequence state handle: %s\n", __func__, err.what());
         return 0;
     }
 }

@@ -909,6 +909,16 @@ extern "C" {
                           size_t   n_token_capacity,
                           size_t * n_token_count_out);
 
+    // Borrow a binary FILE opened by a compatible CRT. Rewinds the file and leaves it open.
+    // Use a retained read-only handle or immutable snapshot when the bytes were prevalidated.
+    LLAMA_API size_t llama_state_seq_load_file_handle(
+            struct llama_context * ctx,
+                           FILE * file,
+                    llama_seq_id   dest_seq_id,
+                     llama_token * tokens_out,
+                          size_t   n_token_capacity,
+                          size_t * n_token_count_out);
+
 #define LLAMA_STATE_SEQ_FLAGS_NONE 0
 
 // for backwards-compat

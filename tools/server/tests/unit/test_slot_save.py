@@ -129,6 +129,28 @@ def test_slot_restore_legacy_token_list():
     assert res.body["timings"]["prompt_n"] == 6  # only the different part is processed
 
 
+def test_checkpoint_bundle_unsupported_model_preserves_idle_prompt():
+    global server
+    server.start()
+    prompt = "The quick brown fox and the sleepy dog"
+    data = {"prompt": prompt, "id_slot": 0, "cache_prompt": True, "n_predict": 1}
+    res = server.make_request("POST", "/completion", data=data)
+    assert res.status_code == 200
+    expected = res.body["content"]
+
+    for action in ("save", "restore"):
+        res = server.make_request("POST", f"/slots/0?action={action}", data={
+            "filename": "unsupported.bundle", "checkpoint_bundle": True,
+        })
+        assert res.status_code == 400
+        assert "Checkpoint bundles require" in res.body["error"]["message"]
+
+    res = server.make_request("POST", "/completion", data=data)
+    assert res.status_code == 200
+    assert res.body["timings"]["cache_n"] > 0
+    assert res.body["content"] == expected
+
+
 
 def test_slot_erase():
     global server

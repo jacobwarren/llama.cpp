@@ -15,6 +15,7 @@
 #include <vector>
 
 struct llama_model;
+struct llama_file;
 class llama_batch_allocr;
 
 class llama_io_read_i;
@@ -197,6 +198,20 @@ struct llama_context {
             const char * filepath,
      const llama_token * tokens,
                 size_t   n_token_count);
+
+    size_t state_seq_load_file(
+          llama_seq_id   seq_id,
+                  FILE * file,
+           llama_token * tokens_out,
+                size_t   n_token_capacity,
+                size_t * n_token_count_out);
+
+    size_t state_seq_load_file_impl(
+          llama_seq_id   seq_id,
+            llama_file & file,
+           llama_token * tokens_out,
+                size_t   n_token_capacity,
+                size_t * n_token_count_out);
 
     //
     // perf

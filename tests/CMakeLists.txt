@@ -328,6 +328,11 @@ set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED 
 # Test state save/load functionality
 llama_build_and_test(test-save-load-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED test-download-model)
+if (LLAMA_BUILD_TOOLS AND LLAMA_BUILD_SERVER AND NOT EMSCRIPTEN)
+    target_compile_definitions(test-save-load-state PRIVATE LLAMA_TEST_CHECKPOINT_BUNDLE)
+    target_link_libraries(test-save-load-state PRIVATE server-context)
+    llama_test(test-save-load-state NAME test-checkpoint-bundle-envelope ARGS --checkpoint-bundle-only)
+endif()
 
 if (APPLE)
     llama_build(test-rset-release.cpp)

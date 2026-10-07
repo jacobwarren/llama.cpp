@@ -1,6 +1,7 @@
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
+#include "server-checkpoint-bundle.h"
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
@@ -19,6 +20,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstring>
 #include <cinttypes>
 #include <exception>
 #include <iterator>
@@ -875,6 +877,11 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    std::filesystem::path checkpoint_model_source;
+    std::filesystem::file_time_type checkpoint_model_mtime;
+    uint64_t checkpoint_model_bytes = 0;
+    std::string checkpoint_model_sha256;
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -1057,6 +1064,18 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
+        std::filesystem::path checkpoint_source_before;
+        std::filesystem::file_time_type checkpoint_mtime_before;
+        uint64_t checkpoint_bytes_before = 0;
+        if (!params_base.slot_save_path.empty()) {
+            try {
+                checkpoint_source_before = std::filesystem::canonical(std::filesystem::u8path(params_base.model.path));
+                checkpoint_bytes_before = std::filesystem::file_size(checkpoint_source_before);
+                checkpoint_mtime_before = std::filesystem::last_write_time(checkpoint_source_before);
+            } catch (const std::exception &) {
+                checkpoint_source_before.clear();
+            }
+        }
         llama_init = common_init_from_params(params_base);
 
         model_tgt = llama_init->model();
@@ -1073,6 +1092,24 @@ private:
         }
 
         vocab = llama_model_get_vocab(model_tgt);
+
+        checkpoint_model_source.clear();
+        checkpoint_model_sha256.clear();
+        if (!params_base.slot_save_path.empty()) {
+            try {
+                const auto source = std::filesystem::canonical(std::filesystem::u8path(params_base.model.path));
+                if (checkpoint_source_before.empty() || source != checkpoint_source_before ||
+                        std::filesystem::file_size(source) != checkpoint_bytes_before ||
+                        std::filesystem::last_write_time(source) != checkpoint_mtime_before) {
+                    throw std::runtime_error("Model source was unavailable or changed during loading");
+                }
+                checkpoint_model_source = source;
+                checkpoint_model_bytes = checkpoint_bytes_before;
+                checkpoint_model_mtime = checkpoint_mtime_before;
+            } catch (const std::exception &) {
+                checkpoint_model_source.clear();
+            }
+        }
 
         n_ctx = llama_n_ctx(ctx_tgt);
 
@@ -2293,6 +2330,64 @@ private:
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
     }
 
+    json checkpoint_bundle_identity(const server_slot & slot) {
+        char arch[64] = {};
+        llama_model_meta_val_str(model_tgt, "general.architecture", arch, sizeof(arch));
+        char split_count[32] = {};
+        const int split_count_length = llama_model_meta_val_str(model_tgt, LLM_KV_SPLIT_COUNT, split_count, sizeof(split_count));
+        const bool has_spec_types = std::any_of(params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                [](common_speculative_type type) { return type != COMMON_SPECULATIVE_TYPE_NONE; });
+        if (std::string(arch) != "qwen35" || params_base.n_gpu_layers != 0 || n_swa != 0 ||
+                params_base.cache_type_k != GGML_TYPE_Q8_0 || params_base.cache_type_v != GGML_TYPE_Q8_0 ||
+                ctx_dft || model_dft || has_spec_types || !common_speculative_get_types(spec.get()).empty() ||
+                mctx || slot.prompt.tokens.has_mtmd || !params_base.lora_adapters.empty() || !slot.lora.empty() ||
+                !params_base.control_vectors.empty() || !params_base.kv_overrides.empty() || !params_base.tensor_buft_overrides.empty() ||
+                !params_base.kv_mean_center_path.empty() || params_base.ctx_shift || params_base.grp_attn_n != 1 ||
+                params_base.embedding || slot.n_ctx > static_cast<int32_t>(SERVER_CHECKPOINT_BUNDLE_MAX_TOKENS) ||
+                (split_count_length > 0 && std::string(split_count) != "1")) {
+            throw std::runtime_error("Checkpoint bundles require one dense qwen35 CPU GGUF, q8_0 K/V, text only, no draft, adapters, SWA, overrides or context shifts");
+        }
+        if (checkpoint_model_source.empty() || std::filesystem::file_size(checkpoint_model_source) != checkpoint_model_bytes ||
+                std::filesystem::last_write_time(checkpoint_model_source) != checkpoint_model_mtime) {
+            throw std::runtime_error("Model source changed or is unavailable; restart before using checkpoint bundles");
+        }
+        if (checkpoint_model_sha256.empty()) {
+            checkpoint_model_sha256 = server_checkpoint_bundle_hash_file(checkpoint_model_source.u8string(), checkpoint_model_bytes);
+            if (std::filesystem::file_size(checkpoint_model_source) != checkpoint_model_bytes ||
+                    std::filesystem::last_write_time(checkpoint_model_source) != checkpoint_model_mtime) {
+                checkpoint_model_sha256.clear();
+                throw std::runtime_error("Model source changed while computing its checkpoint identity");
+            }
+        }
+        const uint16_t endian_probe = 1;
+        return {
+            { "model_sha256", checkpoint_model_sha256 },
+            { "engine", {
+                { "commit", llama_commit() }, { "compiler", llama_compiler() }, { "target", llama_build_target() },
+                { "state_sequence_version", LLAMA_STATE_SEQ_VERSION }, { "server_tokens_version", 1 },
+                { "size_t_bytes", sizeof(size_t) }, { "token_bytes", sizeof(llama_token) },
+                { "byte_order", *reinterpret_cast<const uint8_t *>(&endian_probe) == 1 ? "little" : "big" },
+            }},
+            { "layout", {
+                // Quantized V requires resolved flash attention, so V is not transposed.
+                { "native_state", server_checkpoint_bundle_native_layout(model_tgt, params_base.cache_type_k, params_base.cache_type_v,
+                        false, params_base.kv_unified, llama_n_seq_max(ctx_tgt)) },
+                { "model_layers", llama_model_n_layer(model_tgt) },
+                { "n_ctx", llama_n_ctx(ctx_tgt) }, { "n_ctx_seq", llama_n_ctx_seq(ctx_tgt) }, { "n_ctx_slot", slot.n_ctx },
+                { "n_parallel", params_base.n_parallel }, { "n_rs_seq", llama_n_rs_seq(ctx_tgt) },
+                { "n_batch", llama_n_batch(ctx_tgt) }, { "n_ubatch", llama_n_ubatch(ctx_tgt) },
+                { "cache_type_k", params_base.cache_type_k }, { "cache_type_v", params_base.cache_type_v },
+                { "kv_unified", params_base.kv_unified }, { "swa_full", params_base.swa_full },
+                { "flash_attn", params_base.flash_attn_type }, { "rope_scaling", params_base.rope_scaling_type },
+                { "rope_freq_base", params_base.rope_freq_base }, { "rope_freq_scale", params_base.rope_freq_scale },
+                { "yarn_ext_factor", params_base.yarn_ext_factor }, { "yarn_attn_factor", params_base.yarn_attn_factor },
+                { "yarn_beta_fast", params_base.yarn_beta_fast }, { "yarn_beta_slow", params_base.yarn_beta_slow },
+                { "yarn_orig_ctx", params_base.yarn_orig_ctx }, { "no_kv_offload", params_base.no_kv_offload },
+                { "no_op_offload", params_base.no_op_offload },
+            }},
+        };
+    }
+
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
@@ -2484,6 +2579,37 @@ private:
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
 
+                    if (task.slot_action.checkpoint_bundle) {
+                        try {
+                            const auto identity = checkpoint_bundle_identity(*slot);
+                            const auto checkpoint = std::find_if(slot->prompt.checkpoints.rbegin(), slot->prompt.checkpoints.rend(),
+                                    [&](const common_prompt_checkpoint & cur) {
+                                        return cur.n_tokens > 0 && cur.n_tokens < slot->prompt.n_tokens() && cur.pos_max == cur.n_tokens - 1;
+                                    });
+                            if (checkpoint == slot->prompt.checkpoints.rend()) {
+                                throw std::runtime_error("No checkpoint precedes this slot endpoint");
+                            }
+                            if (llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id) != slot->prompt.n_tokens() - 1) {
+                                throw std::runtime_error("Slot tokens do not match the native endpoint boundary");
+                            }
+                            const auto nwrite = server_checkpoint_bundle_save(filepath, identity, slot->prompt.tokens, *checkpoint, ctx_tgt, slot->id);
+                            auto res = std::make_unique<server_task_result_slot_save_load>();
+                            res->id = task.id;
+                            res->id_slot = id_slot;
+                            res->filename = filename;
+                            res->is_save = true;
+                            res->n_tokens = slot->prompt.tokens.size();
+                            res->n_bytes = nwrite;
+                            res->t_ms = (ggml_time_us() - t_start) / 1000.0;
+                            res->checkpoint_bundle = true;
+                            res->checkpoint_tokens = checkpoint->n_tokens;
+                            queue_results.send(std::move(res));
+                        } catch (const std::exception & err) {
+                            send_error(task, std::string("Unable to save checkpoint bundle: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
+                        }
+                        break;
+                    }
+
                     std::vector<char> packed;
                     try {
                         packed = slot->prompt.tokens.serialize();
@@ -2533,6 +2659,53 @@ private:
 
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
+
+                    if (task.slot_action.checkpoint_bundle) {
+                        bool native_restore_started = false;
+                        try {
+                            auto bundle = server_checkpoint_bundle_read(filepath, checkpoint_bundle_identity(*slot));
+                            if (!bundle.tokens.validate(ctx_tgt)) {
+                                throw std::runtime_error("Invalid tokens in checkpoint bundle");
+                            }
+                            const auto packed_bytes = bundle.tokens.serialize();
+                            llama_tokens packed(packed_bytes.size() / sizeof(llama_token));
+                            std::memcpy(packed.data(), packed_bytes.data(), packed_bytes.size());
+                            native_restore_started = true;
+                            slot->prompt_clear();
+                            // Check the partial state before it can enter the abort-on-failure checkpoint list.
+                            const auto & checkpoint_data = bundle.checkpoint.data_tgt;
+                            if (llama_state_seq_set_data_ext(ctx_tgt, checkpoint_data.data(), checkpoint_data.size(), slot->id,
+                                        LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != checkpoint_data.size()) {
+                                throw std::runtime_error("Invalid native checkpoint state");
+                            }
+                            size_t n_packed = 0;
+                            const auto nread = llama_state_seq_load_file_handle(ctx_tgt, bundle.endpoint_file.get(), slot->id, packed.data(), packed.size(), &n_packed);
+                            if (nread == 0 || n_packed != packed.size() ||
+                                    std::memcmp(packed.data(), packed_bytes.data(), packed_bytes.size()) != 0 ||
+                                    llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id) != static_cast<llama_pos>(bundle.tokens.size() - 1)) {
+                                throw std::runtime_error("Invalid native bundle endpoint");
+                            }
+                            slot->prompt.tokens = std::move(bundle.tokens);
+                            slot->prompt.checkpoints.push_back(std::move(bundle.checkpoint));
+                            auto res = std::make_unique<server_task_result_slot_save_load>();
+                            res->id = task.id;
+                            res->id_slot = id_slot;
+                            res->filename = filename;
+                            res->is_save = false;
+                            res->n_tokens = slot->prompt.tokens.size();
+                            res->n_bytes = bundle.n_bytes;
+                            res->t_ms = (ggml_time_us() - t_start) / 1000.0;
+                            res->checkpoint_bundle = true;
+                            res->checkpoint_tokens = slot->prompt.checkpoints.front().n_tokens;
+                            queue_results.send(std::move(res));
+                        } catch (const std::exception & err) {
+                            if (native_restore_started) {
+                                slot->prompt_clear();
+                            }
+                            send_error(task, std::string("Unable to restore checkpoint bundle: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
+                        }
+                        break;
+                    }
 
                     size_t nread = 0;
                     try {
@@ -5226,6 +5399,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const ser
         task.slot_action.id_slot  = id_slot;
         task.slot_action.filename = filename;
         task.slot_action.filepath = filepath;
+        task.slot_action.checkpoint_bundle = request_data.value("checkpoint_bundle", false);
         rd.post_task(std::move(task));
     }
 
@@ -5262,6 +5436,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const 
         task.slot_action.id_slot  = id_slot;
         task.slot_action.filename = filename;
         task.slot_action.filepath = filepath;
+        task.slot_action.checkpoint_bundle = request_data.value("checkpoint_bundle", false);
         rd.post_task(std::move(task));
     }
 

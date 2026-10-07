@@ -1145,6 +1145,8 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 
 `filename`: Name of the file to save the slot's prompt cache. The file will be saved in the directory specified by the `--slot-save-path` server parameter.
 
+This private fork also has an experimental `"checkpoint_bundle": true` option for save and restore. It requires a fresh filename ending in `.bundle` and publishes an immutable directory containing an endpoint, one recurrent checkpoint and a checked manifest. See [checkpoint bundle prototype](checkpoint-bundle.md) for restrictions, byte limits and pending qualification. The default file format is unchanged.
+
 **Response format**
 
 ```json
