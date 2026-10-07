@@ -29,6 +29,7 @@ static void initialize(ggml_context * ctx, int seed, const geometry_case & c) {
                 blocks[i].d = ggml_fp32_to_fp16(0.00741f + 0.02539f * ((i + weight_seed) % 13));
                 for (size_t j = 0; j < sizeof(blocks[i].qs); ++j) { blocks[i].qs[j] = static_cast<uint8_t>(weight_seed * 83 + i * 31 + j * 17); }
                 for (size_t j = 0; j < sizeof(blocks[i].qh); ++j) { blocks[i].qh[j] = static_cast<uint8_t>(weight_seed * 47 + i * 23 + j * 37); }
+                if (c.kind == 8 && std::strcmp(t->name, "a") == 0) { std::memset(&blocks[i], 0, sizeof(blocks[i])); }
                 if (c.kind == 6 && std::strcmp(t->name, "a") == 0) {
                     const size_t row = i / 40;
                     const size_t kb = i % 40;
@@ -65,11 +66,12 @@ static void initialize(ggml_context * ctx, int seed, const geometry_case & c) {
 }
 
 static ggml_tensor * graph(ggml_context * ctx, const geometry_case & c) {
-    const int storage_k = c.kind == 5 ? c.k + 128 : c.k;
+    const int storage_k = c.kind == 5 || c.kind == 8 ? c.k + 128 : c.k;
     ggml_tensor * a = c.kind == 7 ? ggml_new_tensor_1d(ctx, GGML_TYPE_PTQ1_0, c.k * c.m + 128) :
                                   ggml_new_tensor_2d(ctx, GGML_TYPE_PTQ1_0, storage_k, c.m);
     ggml_set_name(a, "a");
     if (c.kind == 5) { a = ggml_view_2d(ctx, a, c.k, c.m, a->nb[1], 0); }
+    if (c.kind == 8) { a = ggml_view_2d(ctx, a, c.k, c.m, c.k / QK_PTQ1_0 * sizeof(block_ptq1_0) + sizeof(uint32_t), 0); }
     if (c.kind == 7) { a = ggml_view_2d(ctx, a, c.k, c.m, c.k / QK_PTQ1_0 * sizeof(block_ptq1_0), sizeof(block_ptq1_0)); }
     ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.k, c.n);
     ggml_set_name(b, "b");
@@ -129,6 +131,7 @@ int main(int argc, char ** argv) {
     cases.push_back({65, 1, 5120, 5});
     cases.push_back({65, 1, 5120, 7});
     for (int m : {64, 65}) { cases.push_back({m, 1, 5120, 6}); }
+    cases.push_back({64, 1, 5120, 8});
     const uint32_t magic[3] = {0x50545147, 1, static_cast<uint32_t>(cases.size())};
     write_bytes(output, magic, sizeof(magic));
     for (size_t i = 0; i < cases.size(); ++i) {

@@ -1346,7 +1346,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         const int nchannels_x, const int nchannels_y, const int nchannels_dst,
         const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int nsamples_x, const int nsamples_dst, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const int ids_stride, const ggml_cuda_q8_1_layout y_layout, cudaStream_t stream) {
+        const int ids_stride, const ggml_cuda_q8_1_layout y_layout, cudaStream_t stream, const bool cooperative_native_rows = false) {
 
     GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
     GGML_ASSERT(ncols_dst <= MMVQ_MAX_BATCH_SIZE);
@@ -1484,7 +1484,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 if constexpr (type == GGML_TYPE_PTQ1_0 && c_ncols_dst == 1 && c_small_k && !c_halve_iters) {
                     const bool plain = fusion.gate == nullptr && fusion.x_bias == nullptr && fusion.gate_bias == nullptr &&
                                        fusion.x_scale == nullptr && fusion.gate_scale == nullptr;
-                    const bool cooperative = ptq1_0_soa_cooperative_request() && y_soa && plain && !has_ids &&
+                    const bool cooperative = ptq1_0_soa_cooperative_request() && cooperative_native_rows && y_soa && plain && !has_ids &&
                         ncols_x == 5120 && nrows_x >= 64 && stride_row_x == blocks_per_row_x && stride_col_dst == nrows_x &&
                         nchannels_x == 1 && nchannels_y == 1 && nchannels_dst == 1 && nsamples_x == 1 && nsamples_dst == 1 &&
                         cc == GGML_CUDA_CC_BLACKWELL && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_BLACKWELL &&
@@ -1607,7 +1607,7 @@ static void mul_mat_vec_q_switch_type(
         const int nchannels_x, const int nchannels_y, const int nchannels_dst,
         const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int nsamples_x, const int nsamples_dst, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const int ids_stride, const ggml_cuda_q8_1_layout y_layout, cudaStream_t stream) {
+        const int ids_stride, const ggml_cuda_q8_1_layout y_layout, cudaStream_t stream, const bool cooperative_native_rows = false) {
     switch (type_x) {
         case GGML_TYPE_Q1_0:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q1_0>
@@ -1625,7 +1625,7 @@ static void mul_mat_vec_q_switch_type(
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_PTQ1_0>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, y_layout, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, y_layout, stream, cooperative_native_rows);
             break;
         case GGML_TYPE_Q2_0:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q2_0>
@@ -1869,6 +1869,10 @@ void ggml_cuda_mul_mat_vec_q(
         quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), y_layout, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
     }
 
+    // Check actual row bytes before the legacy stride quotients lose their remainder.
+    const bool cooperative_native_rows = src0->type == GGML_TYPE_PTQ1_0 &&
+        src0->nb[1] == ggml_row_size(src0->type, ne00) && dst->nb[1] == ggml_row_size(dst->type, ne0);
+
     const int64_t s01 = src0->nb[1] / ts_src0;
     const int64_t s11 = ne10_padded / QK8_1;
     const int64_t s1  =  dst->nb[1] / ts_dst;
@@ -1895,7 +1899,7 @@ void ggml_cuda_mul_mat_vec_q(
         src0->data, src0->type, src1_q8_1_d, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
-        ne03,              ne3,           s03, s13,              s3,               ids_stride, y_layout, stream);
+        ne03,              ne3,           s03, s13,              s3,               ids_stride, y_layout, stream, cooperative_native_rows);
 }
 
 void ggml_cuda_op_mul_mat_vec_q(
