@@ -18,6 +18,7 @@
 #include <stdexcept>
 
 static int test_checkpoint_bundle_envelope() {
+    ggml_time_init();
     namespace fs = std::filesystem;
     const auto directory = fs::temp_directory_path() / ("llama-checkpoint-test-" + std::to_string(ggml_time_us()) + ".bundle");
     if (!fs::create_directory(directory)) {
