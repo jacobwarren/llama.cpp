@@ -7390,6 +7390,50 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// Native Q8 decode geometry and opt-in fallback controls.
+struct test_flash_attn_ext_gqa6_mma : public test_flash_attn_ext {
+    using test_flash_attn_ext::test_flash_attn_ext;
+    int shifted_src = -1;
+    int masked_tail = 17;
+    ggml_tensor * output = nullptr;
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",gqa6_mma=1," + VARS_TO_STR2(shifted_src, masked_tail);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        output = test_flash_attn_ext::build_graph(ctx);
+        if (shifted_src >= 0) {
+            ggml_tensor * src = output->src[shifted_src];
+            GGML_ASSERT(ggml_is_contiguous(src));
+            const size_t offset = shifted_src == 1 || shifted_src == 2 ? ggml_type_size(src->type) : 8;
+            ggml_tensor * backing = ggml_new_tensor_2d(ctx, src->type, src->ne[0], ggml_nrows(src) + 1);
+            ggml_set_name(backing, "shifted_backing");
+            ggml_tensor * view = ggml_view_4d(ctx, backing, src->ne[0], src->ne[1], src->ne[2], src->ne[3],
+                                            src->nb[1], src->nb[2], src->nb[3], offset);
+            ggml_set_name(view, src->name);
+            output->src[shifted_src] = view;
+        }
+        return output;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+        ggml_tensor * m = output->src[3];
+        if (!m) {
+            return;
+        }
+        std::vector<ggml_fp16_t> data(ggml_nelements(m));
+        for (int64_t row = 0; row < m->ne[1]*m->ne[3]; ++row) {
+            for (int64_t col = 0; col < m->ne[0]; ++col) {
+                const float value = col >= m->ne[0] - masked_tail ? -INFINITY : -(col % 7)*0.0625f;
+                data[row*m->ne[0] + col] = ggml_fp32_to_fp16(value);
+            }
+        }
+        ggml_backend_tensor_set(m, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -10254,6 +10298,50 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 2},  1025,   1, true, true,  8, 30, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  1025,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 16384,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+
+    // Q8 GQA6 one-token MMA opt-in: native cache layouts and guarded fallback cases.
+    for (int64_t kv : { 8192, 8448, 32768, 33024 }) {
+        for (bool kv_view : { false, true }) {
+            test_cases.emplace_back(new test_flash_attn_ext_gqa6_mma(256, 256, 4, {6, 1}, kv, 1, true, false, 0, 0,
+                    GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, kv_view));
+        }
+    }
+    for (int64_t kv : { 8192, 32768 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_gqa6_mma(256, 256, 4, {6, 1}, kv, 1, true, false, 0, 0,
+                GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
+        auto * tail = new test_flash_attn_ext_gqa6_mma(256, 256, 4, {6, 1}, kv, 1, true, false, 0, 0,
+                GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
+        tail->masked_tail = 255;
+        test_cases.emplace_back(tail);
+    }
+    for (int64_t kv : { 7936, 8193 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_gqa6_mma(256, 256, 4, {6, 1}, kv, 1, true, false, 0, 0,
+                GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    }
+    for (int64_t nb : { 2, 3 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_gqa6_mma(256, 256, 4, {6, 1}, 8192, nb, true, false, 0, 0,
+                GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    }
+    for (int64_t nr : { 4, 8 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_gqa6_mma(256, 256, 4, {nr, 1}, 8192, 1, true, false, 0, 0,
+                GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_gqa6_mma(128, 128, 4, {6, 1}, 8192, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext_gqa6_mma(256, 256, 4, {6, 2}, 8192, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext_gqa6_mma(256, 256, 4, {6, 1}, 8192, 1, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext_gqa6_mma(256, 256, 4, {6, 1}, 8192, 1, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext_gqa6_mma(256, 256, 4, {6, 1}, 8192, 1, true, false, 8, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext_gqa6_mma(256, 256, 4, {6, 1}, 8192, 1, true, false, 0, 30, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_F16 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_gqa6_mma(256, 256, 4, {6, 1}, 8192, 1, true, false, 0, 0,
+                GGML_PREC_F32, type, type));
+    }
+    for (int shifted_src : { 0, 1, 2, 3 }) {
+        auto * shifted = new test_flash_attn_ext_gqa6_mma(256, 256, 4, {6, 1}, 8192, 1, true, false, 0, 0,
+                GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, false);
+        shifted->shifted_src = shifted_src;
+        test_cases.emplace_back(shifted);
+    }
 
     // MLA shape: the V cache is a sub-view of the K cache, with quantized KV
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1},  113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
