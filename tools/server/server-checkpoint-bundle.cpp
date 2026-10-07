@@ -46,8 +46,9 @@ uint64_t regular_file_size(const fs::path & path, uint64_t max_bytes) {
 }
 
 uint64_t unsigned_field(const json & value, uint64_t limit) {
-    require(value.is_number_unsigned() || (value.is_number_integer() && value.get<int64_t>() >= 0), "Invalid unsigned bundle field");
+    require(value.is_number_integer(), "Invalid unsigned bundle field");
     const uint64_t result = value.get<uint64_t>();
+    // Negative JSON integers convert above every supported field limit.
     require(result <= limit, "Bundle field exceeds its limit");
     return result;
 }
