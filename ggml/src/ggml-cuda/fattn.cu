@@ -5,6 +5,17 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
+#include <cstdlib>
+#include <cstring>
+
+bool ggml_cuda_fa_q8_gqa6_mma_requested() {
+    static const bool requested = [] {
+        const char * value = std::getenv("GGML_CUDA_FA_Q8_GQA6_MMA");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return requested;
+}
+
 template <int DKQ, int DV, int ncols2, ggml_type type_KV = GGML_TYPE_F16>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -472,6 +483,26 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+
+    if (ggml_cuda_fa_q8_gqa6_mma_requested()) {
+        float logit_softcap;
+        memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+        // Select only the in-place Q8 kernel, so the opt-in never needs a full F16 KV copy.
+        if (cc == GGML_CUDA_CC_BLACKWELL && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_BLACKWELL &&
+                Q->type == GGML_TYPE_F32 && KQV->type == GGML_TYPE_F32 &&
+                Q->ne[0] == 256 && K->ne[0] == 256 && V->ne[0] == 256 &&
+                Q->ne[1] == 1 && Q->ne[2] == 24 && K->ne[2] == 4 && V->ne[2] == 4 && gqa_ratio == 6 &&
+                Q->ne[3] == 1 && K->ne[3] == 1 && V->ne[3] == 1 &&
+                K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 &&
+                K->ne[1] >= 8192 && K->ne[1] == V->ne[1] && K->ne[1] % FATTN_KQ_STRIDE == 0 &&
+                gqa_opt_applies && mask->type == GGML_TYPE_F16 && mask->ne[3] == 1 &&
+                mask->ne[0] >= K->ne[1] && mask->ne[1] >= Q->ne[1] &&
+                max_bias == 0.0f && logit_softcap == 0.0f && !dst->src[4] &&
+                ggml_cuda_is_aligned(Q, 16) && ggml_cuda_is_aligned(mask, 16) && ggml_is_contiguous(KQV) &&
+                ggml_cuda_fattn_mma_kv_native_supported(dst) && !ggml_cuda_batch_invariant()) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
+    }
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
