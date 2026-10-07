@@ -64,6 +64,15 @@ keep `GGML_PTQ1_0_GEMM` unset/0. Backend feature metadata reports
 `PTQ_VNNI_INT8=1` only when build/runtime/capability gates activate; a compact
 kernel can still take precedence for a particular operation.
 
+The private llama-bench result schema adds the string field `cpu_features`
+immediately after `cpu_info` in JSON, JSONL, CSV and SQL output. Its test
+constructor copies the existing public `llama_print_system_info()` result
+outside the timed loops. The string includes `PTQ_VNNI_INT8 = 1` only when
+the effective build/runtime/capability gates activate. This is process
+capability evidence, not per-operation tracing; keep compact GEMM disabled
+when qualifying the signed row-dot route. The default Markdown display
+continues to show its existing selected columns.
+
 ## Source tests and remaining acceptance
 
 The existing quantization test extends all 256 packed-byte patterns at all 128

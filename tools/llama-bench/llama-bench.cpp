@@ -1440,6 +1440,7 @@ struct test {
     static const std::string build_commit;
     static const int         build_number;
     const std::string        cpu_info;
+    const std::string        cpu_features;
     const std::string        gpu_info;
     std::string              model_filename;
     std::string              model_type;
@@ -1476,6 +1477,7 @@ struct test {
 
     test(const cmd_params_instance & inst, const llama_model * lmodel, const llama_context * ctx) :
         cpu_info(get_cpu_info()),
+        cpu_features(llama_print_system_info()),
         gpu_info(get_gpu_info()) {
 
         model_filename = inst.model;
@@ -1558,7 +1560,7 @@ struct test {
 
     static const std::vector<std::string> & get_fields() {
         static const std::vector<std::string> fields = {
-            "build_commit",   "build_number",   "cpu_info",      "gpu_info",       "backends",
+            "build_commit",   "build_number",   "cpu_info",      "cpu_features",   "gpu_info", "backends",
             "model_filename", "model_type",     "model_size",    "model_n_params", "n_batch",
             "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
             "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
@@ -1588,7 +1590,7 @@ struct test {
         if (field == "avg_ts" || field == "stddev_ts") {
             return FLOAT;
         }
-        if (field == "load_mode") {
+        if (field == "load_mode" || field == "cpu_features") {
             return STRING;
         }
         return STRING;
@@ -1634,6 +1636,7 @@ struct test {
         std::vector<std::string> values = { build_commit,
                                             std::to_string(build_number),
                                             cpu_info,
+                                            cpu_features,
                                             gpu_info,
                                             get_backend(),
                                             model_filename,
